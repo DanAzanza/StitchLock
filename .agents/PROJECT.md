@@ -9,15 +9,15 @@
 - **Stage 1 — Auto-Localization & Masking ([`src/auto_masker.py`](../src/auto_masker.py))**: Zero-brush localization (`auto_vision` or deterministic `manifest_roi`). Produces full-resolution `binary_mask` ($\{0, 1\}$), strictly interior Euclidean distance-transform smoothstep `feathered_mask` ($[0.0, 1.0]$), `cropped_model_roi` (full On-Model image at `1024x1024`), `cropped_product_ref` (full Product Reference garment aligned on-frame without zooming so relative logo proportions stay intact), and `cropped_mask_greyscale`.
 - **Stage 2 — Generative Restoration Bridge ([`src/comfy_client.py`](../src/comfy_client.py))**: Pure headless ComfyUI REST/WebSocket client executing [`workflows/qwen_2_1_edit_api.json`](../workflows/qwen_2_1_edit_api.json) (`TextEncodeQwenImage21` + `VAEEncode` + `ImageToMask` + `SetLatentNoiseMask` + `KSampler`). Contains zero OpenCV/offline fallbacks and fails fast with `ComfyExecutionError` if ComfyUI is unreachable.
 - **Stage 3 — Strict Pixel-Lock Compositor ([`src/compositor.py`](../src/compositor.py))**: Resizes restored `1024x1024` ROI back to `context_bbox`, compensates boundary VAE color shift, blends inside the mask via `feathered_mask`, and enforces the hard bitwise pixel lock (`np.where(binary_mask[..., None] > 0, blended_image, original_image)`).
-- **Stage 4 — Automated Verification Gate ([`src/verifier.py`](../src/verifier.py))**: Verifies `unmasked_max_abs_diff == 0`, `unmasked_changed_pixels_count == 0`, `unmasked_ssim == 1.0`, and `masked_changed_pixels_count > 0` (or clean short-circuit when `has_defect == False`). Generates the `x50` amplified diff heatmap and the 4-panel verification report image.
+- **Stage 4 — Automated Verification Gate ([`src/verifier.py`](../src/verifier.py))**: Verifies `unmasked_max_abs_diff == 0`, `unmasked_changed_pixels_count == 0`, `unmasked_ssim == 1.0`, and `masked_changed_pixels_count > 0` (or clean short-circuit when `has_defect == False`). Generates the balanced `4x` (configurable) amplified diff heatmap and the 4-panel verification report image.
 - **Compliance & Housekeeping Utilities ([`src/metadata.py`](../src/metadata.py), [`src/housekeeper.py`](../src/housekeeper.py))**: Zero-recompression PNG `tEXt` chunk processor embedding EU AI Act Article 50 and Pixel-Lock audit tags without touching `IDAT` pixels; sandboxed cleanup of temporary local ComfyUI assets.
-- **Orchestration & Entrypoints ([`src/pipeline.py`](../src/pipeline.py), [`src/comfy_launcher.py`](../src/comfy_launcher.py), [`run_batch.py`](../run_batch.py), [`app.py`](../app.py), [`setup_test_cases.py`](../setup_test_cases.py))**: Flat `<name>.*` + `<name>_reference.*` case discovery, automated ComfyUI Desktop/standalone detection & headless launch (`auto_launch: true` in `config.yaml`), sequential multi-defect loop (`execute_multi_defect_restoration`), flat `outputs/<name>.png` + `outputs/_reports/` persistence shared across CLI & Tab 3 UI, atomic `.part` staging writes, Gradio 5.x web UI (`inbrowser=True`), and deterministic generic fixture generator.
+- **Orchestration & Entrypoints ([`src/pipeline.py`](../src/pipeline.py), [`src/comfy_launcher.py`](../src/comfy_launcher.py), [`run_batch.py`](../run_batch.py), [`app.py`](../app.py), [`setup_test_cases.py`](../setup_test_cases.py))**: Flat `<name>.*` + `<name>_reference.*` case discovery, cross-platform automated ComfyUI Desktop/standalone detection & headless launch (`auto_launch: true` in `config.yaml`, `COMFYUI_DIR` override on Linux), sequential multi-defect loop (`execute_multi_defect_restoration`), flat `outputs/<name>.png` + `outputs/_reports/` persistence shared between CLI and UI, atomic `.part` staging writes, single-page Gradio 6 Artist Studio UI (2-column Inbox + Workspace, `+ Add Look` pop-up, Before/After slider, 1-click Heatmap, `BrowserSessionLifecycle` auto-shutdown), and deterministic generic fixture generator.
 
 ---
 
 ## 2. Runtime & Filesystem Constraints
-- **Platform**: Windows 11 / PowerShell 7+ host; multi-OS GitHub Actions CI matrix (`ubuntu-latest`, `windows-latest`).
-- **Python Runtime**: Local host runs Python 3.14.5 64-bit; project targets Python >= 3.11.
+- **Platform**: Windows 11 / PowerShell 7+ and Linux (`bash`) hosts; multi-OS GitHub Actions CI matrix (`ubuntu-latest`, `windows-latest`, Python `3.12`).
+- **Python & Dependency Runtime**: Project targets Python `>= 3.11`; uses `opencv-python-headless` for X11/libGL-free execution on Linux CI runners; `.gitattributes` enforces `eol=lf` on `*.sh` launchers (`install.sh`, `run_pipeline.sh`) and `eol=crlf` on `*.bat`.
 - **Windows Console & Google Drive Mount (`G:\`)**:
   - Always reconfigure standard streams (`sys.stdout.reconfigure(encoding="utf-8")`) in CLI entrypoints.
   - Write all image and JSON outputs via temporary `.part` staging files (`*.<pid>_<ns>.part`) followed by atomic `Path.replace()` to prevent partial reads by background cloud sync or Windows Search indexers.
@@ -46,6 +46,7 @@
   ```powershell
   python -m ruff check .
   python -m ruff format --check .
+  python -m pyright
   python -m pytest tests -v
   ```
 
