@@ -1,0 +1,41 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{{ON_MODEL_IMAGE}}"
+    }
+  },
+  "2": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{{PRODUCT_REF_IMAGE}}"
+    }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image"
+    }
+  },
+  "4": {
+    "class_type": "TextGenerateV2",
+    "inputs": {
+      "clip": ["3", 0],
+      "prompt": "{{INSPECTION_PROMPT}}",
+      "max_length": 420,
+      "sampling_mode": "off",
+      "images.image1": ["1", 0],
+      "images.image2": ["2", 0],
+      "thinking": false,
+      "use_default_template": true,
+      "mtp": "off"
+    }
+  },
+  "5": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": ["4", 0]
+    }
+  }
+}

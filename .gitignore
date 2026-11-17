@@ -1,0 +1,28 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution & packaging
+build/
+dist/
+*.egg-info/
+
+# Temporary staging, OS & runtime files
+*.part
+.comfyui_server.pid
+.ci_local_staging/
+Thumbs.db
+.DS_Store
+
+# Generated runtime outputs (README showcase assets live in docs/assets/)
+outputs/

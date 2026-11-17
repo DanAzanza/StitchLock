@@ -1,0 +1,24 @@
+pipeline:
+  test_cases_dir: "test_cases"
+  outputs_dir: "outputs"
+  workflow_path: "workflows/qwen_2_1_edit_api.json"
+  inspector_workflow_path: "workflows/qwen3_vl_inspector_api.json"
+
+masking:
+  strategy: "auto_vision"  # Options: "auto_vision" (Qwen3-VL grounding) or "manifest_roi"
+  mask_dilation_ratio: 0.018   # Relative to min(H, W) -> ~18px at 1024px, scales linearly
+  feather_sigma_ratio: 0.006   # Interior smoothstep ramp relative to min(H, W) -> ~6.1px at 1024px
+
+comfyui:
+  server_url: "http://127.0.0.1:8000"
+  fallback_ports: [8000, 8188]
+  timeout_seconds: 180.0
+  seed: 42
+  steps: 20
+  cfg: 1.0
+  denoise: 1.0
+  auto_launch: true  # Auto-start ComfyUI Desktop / standalone backend when offline
+
+verification:
+  diff_amplification_factor: 4.0
+  strict_zero_outside_mask: true

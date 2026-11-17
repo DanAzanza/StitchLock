@@ -1,0 +1,205 @@
+/* StitchLocker Studio — Clean Full-Height Artist-First Layout & Upload Pop-Up */
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+}
+
+.gradio-container {
+    max-width: 1560px !important;
+    min-height: 100vh !important;
+    margin: 0 auto !important;
+    padding: 12px 22px 14px 22px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    box-sizing: border-box !important;
+}
+
+.stitch-header {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.10), rgba(59, 130, 246, 0.06));
+    border: 1px solid rgba(148, 163, 184, 0.20);
+    border-radius: 14px;
+    padding: 10px 20px;
+    margin-bottom: 10px;
+    flex: 0 0 auto !important;
+}
+
+.stitch-header h1 {
+    margin: 0 0 2px 0 !important;
+    font-size: 1.4rem !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.02em !important;
+}
+
+.stitch-header p {
+    margin: 0 !important;
+    opacity: 0.78;
+    font-size: 0.88rem !important;
+}
+
+.stitch-main-row {
+    flex: 1 1 auto !important;
+    align-items: stretch !important;
+    min-height: calc(100vh - 108px) !important;
+}
+
+.stitch-sidebar {
+    background: rgba(15, 23, 42, 0.32);
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 14px;
+    padding: 14px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: flex-start !important;
+    gap: 8px !important;
+    align-self: stretch !important;
+}
+
+.stitch-sidebar > .styler,
+.stitch-sidebar > div:has([data-testid="gallery"]) {
+    flex: 1 1 auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    min-height: 0 !important;
+}
+
+.stitch-sidebar [data-testid="gallery"],
+.stitch-sidebar .gallery-container,
+.stitch-sidebar .grid-wrap,
+.stitch-sidebar .grid-wrap.fixed-height {
+    height: auto !important;
+    max-height: calc(100vh - 205px) !important;
+    overflow-y: auto !important;
+}
+
+.stitch-sidebar .grid-wrap button.thumbnail-item {
+    height: 155px !important;
+    min-height: 155px !important;
+}
+
+.stitch-workspace {
+    background: rgba(15, 23, 42, 0.22);
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 14px;
+    padding: 14px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: flex-start !important;
+    gap: 8px !important;
+    align-self: stretch !important;
+}
+
+/* Filename bar & uniform uncropped display for Original | Product Reference | Repaired */
+.stitch-look-bar {
+    background: rgba(30, 41, 59, 0.55);
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 10px;
+    padding: 8px 14px;
+    margin-bottom: 4px;
+}
+
+.stitch-look-bar p {
+    margin: 0 !important;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+    font-size: 0.90rem !important;
+    font-weight: 600 !important;
+    word-break: break-all;
+}
+
+.stitch-triad {
+    align-items: flex-start !important;
+}
+
+.stitch-repaired-col {
+    gap: 8px !important;
+}
+
+.stitch-repaired-col button {
+    flex-grow: 0 !important;
+}
+
+.stitch-triad .image-container,
+.stitch-triad [data-testid="image"] {
+    height: 225px !important;
+}
+
+.stitch-triad .image-frame {
+    height: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+.stitch-triad img {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    width: auto !important;
+    height: auto !important;
+    object-fit: contain !important;
+}
+
+/* Centered, uncropped, pixel-aligned stage for Before/After Compare Slider & Heatmap */
+.stitch-compare-stage {
+    max-width: 500px !important;
+    width: 100% !important;
+    margin: 4px auto 0 auto !important;
+}
+
+.stitch-compare-stage img {
+    object-fit: contain !important;
+}
+
+/* Fullscreen modal overlay for "+ Add Look" pop-up with transparent rounded corners */
+#stitch-add-modal {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 9999 !important;
+    background: rgba(2, 6, 23, 0.76) !important;
+    backdrop-filter: blur(6px) !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 24px !important;
+    border-radius: 0 !important;
+    border: none !important;
+}
+
+#stitch-add-modal:not(.hide):not(.hidden):not([hidden]) {
+    display: flex;
+}
+
+#stitch-add-modal > .gr-group,
+#stitch-add-modal .styler,
+#stitch-add-modal .form {
+    position: static !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+}
+
+.stitch-modal-card {
+    background: #0f172a !important;
+    border: 1px solid rgba(148, 163, 184, 0.28) !important;
+    border-radius: 16px !important;
+    overflow: hidden !important;
+    background-clip: padding-box !important;
+    padding: 20px 22px !important;
+    width: min(760px, 94vw) !important;
+    max-width: 760px !important;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55) !important;
+}
+
+.stitch-modal-header {
+    align-items: center !important;
+    justify-content: space-between !important;
+    margin-bottom: 10px !important;
+}
+
+.stitch-modal-header h3 {
+    margin: 0 !important;
+}
+
+footer {
+    display: none !important;
+}

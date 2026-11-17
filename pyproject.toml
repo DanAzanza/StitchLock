@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garment-fix-pipeline"
+version = "1.0.0"
+description = "Automated E-Commerce Garment Detail Correction Pipeline with Mathematical Pixel-Lock Guarantee"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Daniel" }]
+dependencies = [
+    "numpy>=1.26.0",
+    "opencv-python-headless>=4.9.0",
+    "Pillow>=10.2.0",
+    "PyYAML>=6.0.1",
+    "requests>=2.31.0",
+    "websocket-client>=1.7.0",
+]
+
+[project.optional-dependencies]
+ui = ["gradio>=5.0.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.4.0", "pyright>=1.1.350"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["outputs", "test_cases"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pyright]
+include = ["src", "tests", "setup_test_cases.py", "run_batch.py", "app.py"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
