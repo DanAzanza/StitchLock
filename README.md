@@ -52,8 +52,8 @@ All showcase cases use **100% synthetic, trademark-free studio assets** (front p
 
 | Case ID | Garment Detail | Localization Strategy | Backend | Unmasked Pixels Verified | `unmasked_max_abs_diff` | `unmasked_changed_pixels` | `unmasked_ssim` | Status |
 | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| `kova_zip_jacket` | White hexagonal compass crest and `KOVA` chest embroidery | `qwen3_vl_8b + vlm_grounded_box` | `comfyui_qwen_2_1` | `1,010,776 / 1,048,576` | **`0`** | **`0 (0.0000%)`** | **`1.0000`** | **PASS** |
-| `sage_sweatpant` | Small rust-terracotta and cream oval twin-mountain crest | `qwen3_vl_8b + vlm_grounded_box` | `comfyui_qwen_2_1` | `1,017,036 / 1,048,576` | **`0`** | **`0 (0.0000%)`** | **`1.0000`** | **PASS** |
+| `kova_zip_jacket` | White hexagonal compass crest and `KOVA` chest embroidery | `qwen3_vl_8b + vlm_grounded_box` | `comfyui_qwen_2_1` | `1,006,576 / 1,048,576` | **`0`** | **`0 (0.0000%)`** | **`1.0000`** | **PASS** |
+| `sage_sweatpant` | Small rust-terracotta and cream oval twin-mountain crest | `qwen3_vl_8b + vlm_grounded_box` | `comfyui_qwen_2_1` | `1,028,136 / 1,048,576` | **`0`** | **`0 (0.0000%)`** | **`1.0000`** | **PASS** |
 
 ---
 
@@ -106,7 +106,9 @@ StitchLocker/
 ├── pyproject.toml                      # Project metadata, dependencies, Ruff, Pyright & Pytest config
 ├── requirements.txt                    # Runtime, Studio UI & CI dependencies
 ├── install.bat                         # Windows 1-Click venv installer & CI self-test runner
+├── install.sh                          # Linux/macOS 1-Click venv installer & CI self-test runner
 ├── run_pipeline.bat                    # Windows 1-Click Artist Studio UI launcher (auto ComfyUI lifecycle)
+├── run_pipeline.sh                     # Linux/macOS 1-Click Artist Studio UI launcher (auto ComfyUI lifecycle)
 ├── setup_test_cases.py                 # Ensures flat `<name>.png` + `<name>_reference.png` fixtures exist
 ├── run_batch.py                        # Zero-touch CLI batch runner (fails fast if ComfyUI offline)
 ├── app.py                              # Gradio 6.x 2-Column Artist Studio UI with `+ Add Look` pop-up
@@ -196,8 +198,9 @@ We eliminate both failure modes through two mathematical invariants:
 
 ## 5. Quickstart & Reproducible Verification
 
-### Option A: Windows 1-Click Web UI Launcher
-Double-click **`install.bat`** once to set up the environment, then launch **`run_pipeline.bat`** to start ComfyUI automatically, open the interactive Web UI (`http://127.0.0.1:7860`) in your browser, manage the `test_cases/` inbox (single-case processing or full batch), and cleanly shut down ComfyUI when the browser tab closes.
+### Option A: 1-Click Artist Studio Launcher (Windows & Linux/macOS)
+- **Windows**: Double-click **`install.bat`** once to set up the environment, then launch **`run_pipeline.bat`** to start ComfyUI automatically, open the interactive Web UI (`http://127.0.0.1:7860`) in your browser, manage the `test_cases/` inbox (single-case processing or full batch), and cleanly shut down ComfyUI when the browser tab closes.
+- **Linux / macOS**: Run `./install.sh` once, then `./run_pipeline.sh` (set `COMFYUI_DIR=/path/to/ComfyUI` if your local ComfyUI install is in a custom path).
 
 ### Option B: CLI Commands
 ```bash

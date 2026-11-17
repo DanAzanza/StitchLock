@@ -35,24 +35,36 @@ DEFAULT_INSPECTION_PROMPT = (
     "Compare Image 1 (generated On-Model photo) and Image 2 "
     "(authentic full-garment Product Reference).\n"
     "1. Identify ALL distinct garment defects where a logo, emblem, embroidery, patch, or text "
-    "in Image 1 is hallucinated, misspelled, wrong scale, or mismatched compared to Image 2 "
-    "(0 if accurate, 1 for a single defect, up to 4 separated regions).\n"
+    "in Image 1 is hallucinated, misspelled, wrong scale, or in the WRONG POSITION compared to "
+    "Image 2 (0 if accurate, 1 for an in-place defect, up to 4 separated regions).\n"
     "   - GROUPING RULE: Keep one emblem together with any text/signature directly beneath it "
     "as ONE single defect box. ONLY split into multiple entries in 'defects' when errors sit "
-    "on separated parts of the garment (e.g. chest vs. sleeve, or upper pocket vs. thigh).\n"
+    "on separated parts of the garment.\n"
+    "   - MISPLACED LOGO RULE: If a logo/patch on Image 1 sits on the WRONG garment zone compared "
+    "to Image 2 (for example, low mid-thigh on Image 1 instead of high near the hip pocket in "
+    "Image 2, so the true position in Image 1 is blank fabric), emit TWO SEPARATED defect "
+    "entries:\n"
+    "     (a) ERASE entry: model_bbox_2d = tight around the misplaced logo in Image 1, "
+    "ref_bbox_2d = empty plain fabric at the matching zone in Image 2, edit_prompt = "
+    "'Edit <image1>: Remove and erase the misplaced logo completely, leaving clean seamless "
+    "plain garment fabric matching <image2>.'\n"
+    "     (b) INSERT entry: model_bbox_2d = tight box on the EMPTY garment location in Image 1 "
+    "corresponding anatomically to where the detail sits in Image 2 (e.g., upper thigh below "
+    "pocket), ref_bbox_2d = tight box around the authentic detail in Image 2, edit_prompt = "
+    "'Edit <image1>: Add ONLY the authentic <graphic, colors, count> from Image 2 onto this "
+    "spot, matching <image2> in position and size.'\n"
     "2. For each defect entry, provide two INDEPENDENT 2D bounding boxes [xmin, ymin, xmax, ymax] "
     "(scale 0 to 1000):\n"
-    "   - model_bbox_2d: TIGHT box enclosing ONLY that defective logo/graphic assembly in Image 1 "
+    "   - model_bbox_2d: TIGHT box enclosing ONLY that defective/target spot in Image 1 "
     "(never touching hands/skin or spanning unrelated intact logos).\n"
-    "   - ref_bbox_2d: TIGHT box enclosing the matching authentic detail in Image 2, measured "
-    "strictly in Image 2's own pixel space.\n"
-    "3. For each defect entry, write ONE direct imperative edit_prompt starting with 'Replace':\n"
+    "   - ref_bbox_2d: TIGHT box in Image 2 measured strictly in Image 2's own pixel space.\n"
+    "3. For in-place defects, write ONE direct imperative edit_prompt starting with 'Replace':\n"
     "'Edit <image1>: Replace <the defective graphic and any text beneath it> with ONLY "
     "<the exact authentic graphic, emblem count, colors, and text from Image 2>, erasing the old "
     "shape completely and matching <image2> in position and size.'\n"
     "IMPORTANT rules for edit_prompt:\n"
     "- NEVER say 'left chest', 'right chest', 'left leg', or 'right thigh' (viewer vs. wearer "
-    "perspective swaps sides); refer directly to the visible defective graphic.\n"
+    "perspective swaps sides); refer directly to the visible graphic or garment pocket/seam.\n"
     "- State exact emblem count and clear details matching <image2> directly.\n"
     "Respond ONLY with valid JSON:\n"
     '{"has_defect": true, "defect_summary": "...", "defects": ['
@@ -152,7 +164,9 @@ class Qwen3VLInspector:
         refined_defects: list[DefectTarget] = []
         for idx, defect in enumerate(parsed.resolved_defects, start=1):
             ref_box = defect.reference_detail_box
-            if not self._has_graphic_contrast(ref_rgb, ref_box):
+            if not self._is_erase_defect(defect.edit_prompt) and not self._has_graphic_contrast(
+                ref_rgb, ref_box
+            ):
                 located = self._locate_ref_detail_single_image(
                     server_url=server_url,
                     ref_rgb=ref_rgb,
@@ -407,7 +421,11 @@ class Qwen3VLInspector:
         deduped = cls._merge_overlapping_defects(parsed_defects)
         ordered = sorted(
             deduped[:MAX_DEFECTS_PER_IMAGE],
-            key=lambda d: (d.model_target_box.y_min, d.model_target_box.x_min),
+            key=lambda d: (
+                0 if cls._is_erase_defect(d.edit_prompt) else 1,
+                d.model_target_box.y_min,
+                d.model_target_box.x_min,
+            ),
         )
         primary = ordered[0]
         combined_summary = (
@@ -467,8 +485,16 @@ class Qwen3VLInspector:
         )
 
     @staticmethod
+    def _is_erase_defect(edit_prompt: str) -> bool:
+        """Return True when the defect only removes/erases a misplaced graphic."""
+        lower = edit_prompt.lower()
+        has_erase = any(tok in lower for tok in ("remove", "erase", "delete"))
+        has_replace_or_add = any(tok in lower for tok in ("replace", "add ", "insert"))
+        return has_erase and not has_replace_or_add
+
+    @staticmethod
     def _normalize_edit_prompt(raw_prompt: str, fallback_prompt: str | None) -> str:
-        """Enforce unambiguous `Edit <image1>: Replace ... <image2>` instruction format."""
+        """Enforce unambiguous `Edit <image1>: ... <image2>` instruction format."""
         cleaned = raw_prompt.strip()
         if not cleaned:
             return fallback_prompt or (
@@ -480,7 +506,19 @@ class Qwen3VLInspector:
             if cleaned.startswith("Edit <image1>:")
             else cleaned
         )
-        action_verbs = ("replace", "change", "fix", "restore", "correct", "swap", "add")
+        action_verbs = (
+            "replace",
+            "change",
+            "fix",
+            "restore",
+            "correct",
+            "swap",
+            "add",
+            "remove",
+            "erase",
+            "delete",
+            "insert",
+        )
         if not any(v in body.lower() for v in action_verbs):
             body = f"Replace the defective graphic in <image1> with {body}"
         body = re.sub(

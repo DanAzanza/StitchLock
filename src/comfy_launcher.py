@@ -6,6 +6,8 @@ import atexit
 import contextlib
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -136,18 +138,23 @@ def detect_comfy_desktop_instance() -> ComfyInstance | None:
 
 
 def _resolve_standalone_python(cand: Path) -> Path:
-    venv_py = (
-        cand
-        / ".venv"
-        / ("Scripts" if sys.platform == "win32" else "bin")
-        / ("python.exe" if sys.platform == "win32" else "python")
-    )
-    if venv_py.is_file():
-        return venv_py
-    embedded = cand.parent / "python_embeded" / "python.exe"
-    if embedded.is_file():
-        return embedded
-    return Path(sys.executable)
+    bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+    py_name = "python.exe" if sys.platform == "win32" else "python"
+    for env_name in (".venv", "venv"):
+        venv_py = cand / env_name / bin_dir / py_name
+        if venv_py.is_file():
+            return venv_py
+        if sys.platform != "win32":
+            py3 = cand / env_name / bin_dir / "python3"
+            if py3.is_file():
+                return py3
+    if sys.platform == "win32":
+        embedded = cand.parent / "python_embeded" / "python.exe"
+        if embedded.is_file():
+            return embedded
+        return Path(sys.executable)
+    which_py3 = shutil.which("python3")
+    return Path(which_py3) if which_py3 else Path(sys.executable)
 
 
 def detect_standalone_instance() -> ComfyInstance | None:
@@ -172,12 +179,21 @@ def detect_standalone_instance() -> ComfyInstance | None:
                 base_dir=cand_dir,
             )
 
-    candidates = [
-        Path.home() / "Documents" / "ComfyUI",
-        Path.home() / "ComfyUI",
-        Path("C:/ComfyUI_windows_portable/ComfyUI"),
-        Path("D:/ComfyUI_windows_portable/ComfyUI"),
-    ]
+    if sys.platform == "win32":
+        candidates = [
+            Path.home() / "Documents" / "ComfyUI",
+            Path.home() / "ComfyUI",
+            Path("C:/ComfyUI_windows_portable/ComfyUI"),
+            Path("D:/ComfyUI_windows_portable/ComfyUI"),
+        ]
+    else:
+        candidates = [
+            Path.home() / "ComfyUI",
+            Path.home() / "comfy" / "ComfyUI",
+            Path.home() / "Documents" / "ComfyUI",
+            Path("/workspace/ComfyUI"),
+            Path("/opt/ComfyUI"),
+        ]
     for cand in candidates:
         if not cand.is_dir():
             continue
@@ -335,6 +351,16 @@ def stop_auto_started_server() -> None:
                 capture_output=True,
                 check=False,
             )
+        return
+    killpg = getattr(os, "killpg", None)
+    if callable(killpg):
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=4.0)
+            return
+        with contextlib.suppress(OSError):
+            sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            killpg(proc.pid, sigkill)
         return
     with contextlib.suppress(OSError):
         proc.terminate()

@@ -1072,3 +1072,81 @@ def test_ui_add_pair_to_inbox_tile_and_collision_handling(tmp_path: Path) -> Non
         add_pair_to_inbox(None, ref_file, config_override=cfg)
     with pytest.raises(PipelineError):
         add_pair_to_inbox(model_file, None, config_override=cfg)
+
+
+def test_vlm_misplaced_logo_erase_prompt_and_linux_launcher_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from src.comfy_launcher import detect_standalone_instance
+
+    # 1. Misplaced logo two-pass JSON (erase + insert) keeps erase prompt intact
+    #    and skips contrast logo re-lookup on the plain-fabric erase defect.
+    model_rgb = np.full((256, 256, 3), 100, dtype=np.uint8)
+    model_rgb[155:195, 95:130] = 210  # misplaced lower logo
+    ref_rgb = np.full((256, 256, 3), 100, dtype=np.uint8)
+    ref_rgb[70:95, 80:105] = 220  # true higher pocket badge
+
+    raw_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Misplaced patch",
+            "defects": [
+                {
+                    "defect_summary": "Remove misplaced lower patch",
+                    "model_bbox_2d": [360, 590, 520, 770],
+                    "ref_bbox_2d": [300, 600, 450, 750],
+                    "edit_prompt": (
+                        "Edit <image1>: Remove and erase the misplaced patch, "
+                        "leaving plain matching fabric from <image2>."
+                    ),
+                },
+                {
+                    "defect_summary": "Add authentic upper pocket badge",
+                    "model_bbox_2d": [350, 460, 460, 560],
+                    "ref_bbox_2d": [310, 270, 410, 370],
+                    "edit_prompt": (
+                        "Edit <image1>: Add ONLY the authentic circular badge from <image2>."
+                    ),
+                },
+            ],
+        }
+    )
+    parsed = Qwen3VLInspector.parse_vlm_json_response(
+        raw_text=raw_json, model_rgb=model_rgb, ref_rgb=ref_rgb
+    )
+    assert len(parsed.resolved_defects) == 2
+    d_erase, d_insert = parsed.resolved_defects
+    assert Qwen3VLInspector._is_erase_defect(d_erase.edit_prompt) is True
+    assert Qwen3VLInspector._is_erase_defect(d_insert.edit_prompt) is False
+    assert "Remove and erase" in d_erase.edit_prompt
+
+    # Verify inspect_garment_pair only invokes solo ref lookup for non-erase defects
+    inspector_wf = ROOT_DIR / "workflows" / "qwen3_vl_inspector_api.json"
+    inspector = Qwen3VLInspector(ComfyConfig(), inspector_wf)
+    solo_calls: list[str] = []
+    plain_ref = np.full((256, 256, 3), 100, dtype=np.uint8)
+    monkeypatch.setattr(inspector, "_run_comfy_vlm", lambda *args, **kwargs: raw_json)
+    monkeypatch.setattr(
+        inspector,
+        "_locate_ref_detail_single_image",
+        lambda **kwargs: solo_calls.append(kwargs["case_id"]) or None,
+    )
+    inspector.inspect_garment_pair(model_rgb, plain_ref, "sage_sweatpant", "http://127.0.0.1:8000")
+    assert solo_calls == ["sage_sweatpant_d2"]
+
+    # 2. Linux standalone ComfyUI detection resolves ~/ComfyUI/venv/bin/python
+    fake_home = tmp_path / "home"
+    comfy_dir = fake_home / "ComfyUI"
+    venv_bin = comfy_dir / "venv" / ("Scripts" if sys.platform == "win32" else "bin")
+    venv_bin.mkdir(parents=True)
+    py_file = venv_bin / ("python.exe" if sys.platform == "win32" else "python")
+    py_file.write_bytes(b"")
+    (comfy_dir / "main.py").write_text("# mock", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("COMFYUI_DIR", raising=False)
+    inst = detect_standalone_instance()
+    assert inst is not None
+    assert inst.python_exe == py_file
+    assert inst.main_py == comfy_dir / "main.py"
