@@ -112,7 +112,7 @@ class PixelLockVerifier:
         mask_u8 = (binary_mask > 0).astype(np.uint8) * 255
         contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(heatmap_rgb, contours, -1, (0, 255, 220), 2)
-        return heatmap_rgb
+        return np.asarray(heatmap_rgb, dtype=np.uint8)
 
     def render_four_panel_report(
         self,

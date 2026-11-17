@@ -52,7 +52,10 @@ def run_all_ci_stages(
             "Ruff Formatter", [python_executable, "-m", "ruff", "format", "--check", "."]
         ):
             return 1
-        if not run_stage("Pyright Type Check", [python_executable, "-m", "pyright"]):
+        if not run_stage(
+            "Pyright Type Check",
+            [python_executable, "-m", "pyright", "--pythonpath", python_executable],
+        ):
             return 1
 
     if not skip_tests and not run_stage(
