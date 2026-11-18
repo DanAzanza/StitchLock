@@ -255,8 +255,12 @@ class AutoMasker:
         is_erase_pass = any(tok in prompt_lower for tok in ("remove", "erase", "delete")) and not (
             any(tok in prompt_lower for tok in ("replace", "add ", "insert"))
         )
+        is_insert_pass = any(tok in prompt_lower for tok in ("add ", "insert")) and not (
+            any(tok in prompt_lower for tok in ("replace", "remove", "erase", "delete"))
+        )
         is_micro_target = (
             not is_erase_pass
+            and not is_insert_pass
             and min(height, width) >= 512
             and max(target_bbox.width / float(width), target_bbox.height / float(height)) <= 0.080
             and (target_bbox.width + 2 * micro_dilation_px) <= crop_side

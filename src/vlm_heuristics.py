@@ -14,7 +14,7 @@ from src.models import DefectTarget, HeuristicConfig, NormalizedBox
 _DEFAULT_HEURISTICS = HeuristicConfig()
 _BOX_PAD_NORM: Final[float] = 0.025
 _MIN_BOX_SPAN_NORM: Final[float] = 0.02
-_INSERT_BOX_MIN_NORM: Final[float] = 0.055
+_INSERT_BOX_MIN_NORM: Final[float] = 0.064
 _INSERT_BOX_MAX_NORM: Final[float] = 0.22
 _EMBLEM_MAX_ASPECT: Final[float] = 3.0
 _GARMENT_GRID_U: Final[tuple[tuple[float, float], ...]] = (
@@ -371,11 +371,11 @@ def split_misplaced_defect_if_shifted(
         target_cy = max(my1 + 0.10 * (my2 - my1), min(my2 - 0.10 * (my2 - my1), expected_mcy))
     elif m_cy > expected_mcy:
         min_allowed_cy = my1 + 0.15 * (my2 - my1)
-        clear_above_cy = max(min_allowed_cy, erase_box.y_min - 0.5 * ins_h - 0.004)
+        clear_above_cy = max(min_allowed_cy, erase_box.y_min - 0.5 * ins_h + 0.012)
         target_cy = min(expected_mcy, clear_above_cy)
     else:
         max_allowed_cy = my2 - 0.15 * (my2 - my1)
-        clear_below_cy = min(max_allowed_cy, erase_box.y_max + 0.5 * ins_h + 0.004)
+        clear_below_cy = min(max_allowed_cy, erase_box.y_max + 0.5 * ins_h - 0.012)
         target_cy = max(expected_mcy, clear_below_cy)
 
     h, w = model_rgb.shape[:2]

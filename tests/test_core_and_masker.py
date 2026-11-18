@@ -219,6 +219,17 @@ def test_auto_masker_micro_roi_supersampling_and_boundaries(tmp_path: Path) -> N
         large_model, large_ref, erase_micro_manifest
     ).context_bbox == PixelBBox(0, 0, 1024, 1024)
 
+    insert_micro_manifest = replace(
+        micro_manifest,
+        prompt=(
+            "Edit <image1>: Add ONLY the authentic small detail from Image 2 onto this spot, "
+            "matching <image2> in size and design."
+        ),
+    )
+    assert masker.localize_and_mask(
+        large_model, large_ref, insert_micro_manifest
+    ).context_bbox == PixelBBox(0, 0, 1024, 1024)
+
     sub512_model = np.full((511, 511, 3), 40, dtype=np.uint8)
     assert masker.localize_and_mask(sub512_model, large_ref, micro_manifest).context_bbox == (
         PixelBBox(0, 0, 511, 511)
