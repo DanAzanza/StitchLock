@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
+from typing import Final
+
 import cv2
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +12,21 @@ from numpy.typing import NDArray
 from src.models import DefectTarget, HeuristicConfig, NormalizedBox
 
 _DEFAULT_HEURISTICS = HeuristicConfig()
+_BOX_PAD_NORM: Final[float] = 0.025
+_MIN_BOX_SPAN_NORM: Final[float] = 0.02
+_INSERT_BOX_MIN_NORM: Final[float] = 0.055
+_INSERT_BOX_MAX_NORM: Final[float] = 0.22
+_EMBLEM_MAX_ASPECT: Final[float] = 3.0
+_GARMENT_GRID_U: Final[tuple[tuple[float, float], ...]] = (
+    (0.08, 0.44),
+    (0.32, 0.68),
+    (0.56, 0.92),
+)
+_GARMENT_GRID_V: Final[tuple[tuple[float, float], ...]] = (
+    (0.14, 0.46),
+    (0.36, 0.66),
+    (0.58, 0.90),
+)
 
 
 def sample_studio_bg_rgb(image_rgb: NDArray[np.uint8]) -> NDArray[np.float32]:
@@ -113,10 +131,10 @@ def refine_connected_graphic_box(
             return prior_box
 
     padded = NormalizedBox(
-        max(0.0, vlm_box.x_min - 0.025),
-        max(0.0, vlm_box.y_min - 0.025),
-        min(1.0, vlm_box.x_max + 0.025),
-        min(1.0, vlm_box.y_max + 0.025),
+        max(0.0, vlm_box.x_min - _BOX_PAD_NORM),
+        max(0.0, vlm_box.y_min - _BOX_PAD_NORM),
+        min(1.0, vlm_box.x_max + _BOX_PAD_NORM),
+        min(1.0, vlm_box.y_max + _BOX_PAD_NORM),
     )
     h, w = image_rgb.shape[:2]
     px = padded.to_pixel_bbox(w, h)
@@ -163,11 +181,11 @@ def refine_connected_graphic_box(
     if gy2 <= padded.y_max - 0.005:
         return padded
     gx1, gx2 = (px.x1 + int(xs.min())) / float(w), (px.x1 + int(xs.max())) / float(w)
-    nx1 = max(0.0, min(padded.x_min, gx1 - 0.025))
-    ny1 = min(padded.y_max - 0.02, max(0.0, max(padded.y_min, gy1 - 0.035)))
-    nx2 = min(1.0, max(padded.x_max, gx2 + 0.025))
-    ny2 = min(1.0, max(padded.y_max, gy2 + 0.025))
-    if nx2 - nx1 < 0.02 or ny2 - ny1 < 0.02:
+    nx1 = max(0.0, min(padded.x_min, gx1 - _BOX_PAD_NORM))
+    ny1 = min(padded.y_max - _MIN_BOX_SPAN_NORM, max(0.0, max(padded.y_min, gy1 - 0.035)))
+    nx2 = min(1.0, max(padded.x_max, gx2 + _BOX_PAD_NORM))
+    ny2 = min(1.0, max(padded.y_max, gy2 + _BOX_PAD_NORM))
+    if nx2 - nx1 < _MIN_BOX_SPAN_NORM or ny2 - ny1 < _MIN_BOX_SPAN_NORM:
         return padded
     return NormalizedBox(round(nx1, 4), round(ny1, 4), round(nx2, 4), round(ny2, 4))
 
@@ -347,8 +365,8 @@ def split_misplaced_defect_if_shifted(
 
     raw_w = (true_rx2 - true_rx1) * (mx2 - mx1) / max(0.1, rx2 - rx1) + 0.026
     raw_h = (true_ry2 - true_ry1) * (my2 - my1) / max(0.1, ry2 - ry1) + 0.030
-    ins_w = min(0.22, max(0.055, raw_w))
-    ins_h = min(0.22, max(0.055, raw_h))
+    ins_w = min(_INSERT_BOX_MAX_NORM, max(_INSERT_BOX_MIN_NORM, raw_w))
+    ins_h = min(_INSERT_BOX_MAX_NORM, max(_INSERT_BOX_MIN_NORM, raw_h))
     if not y_shifted:
         target_cy = max(my1 + 0.10 * (my2 - my1), min(my2 - 0.10 * (my2 - my1), expected_mcy))
     elif m_cy > expected_mcy:
@@ -400,10 +418,24 @@ def split_misplaced_defect_if_shifted(
     return [erase_target, insert_target]
 
 
+def _compute_foreground_mask(
+    patch: NDArray[np.float32], bg_med: NDArray[np.float32], bg_thr: float
+) -> NDArray[np.bool_]:
+    """Exclude only border-connected backdrop components so interior white logos stay foreground."""
+    bg_raw = (np.linalg.norm(patch - bg_med.reshape(1, 1, 3), axis=2) <= bg_thr).astype(np.uint8)
+    _, labels = cv2.connectedComponents(bg_raw)
+    border_vals = np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
+    border_labels = [int(lbl) for lbl in np.unique(border_vals) if int(lbl) != 0]
+    if not border_labels:
+        return np.ones(patch.shape[:2], dtype=np.bool_)
+    return ~np.isin(labels, border_labels)
+
+
 def find_salient_emblem_box(
     image_rgb: NDArray[np.uint8],
     hint_box: NormalizedBox,
     heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
+    garment_bounds: tuple[float, float, float, float] | None = None,
 ) -> NormalizedBox | None:
     """Locate a compact high-contrast garment emblem inside the candidate zone."""
     h, w = image_rgb.shape[:2]
@@ -411,16 +443,24 @@ def find_salient_emblem_box(
         return None
     bg_med = sample_studio_bg_rgb(image_rgb)
     px = hint_box.to_pixel_bbox(w, h)
-    sx1, sx2 = max(0, px.x1 - int(0.06 * w)), min(w, px.x2 + int(0.06 * w))
-    sy1, sy2 = max(0, px.y1 - int(0.06 * h)), min(h, px.y2 + int(0.06 * h))
+    pad_ratio = 0.03 if garment_bounds is not None else 0.06
+    gx1, gy1, gx2, gy2 = (
+        (
+            max(0, int(round(garment_bounds[0] * w))),
+            max(0, int(round(garment_bounds[1] * h))),
+            min(w, int(round(garment_bounds[2] * w))),
+            min(h, int(round(garment_bounds[3] * h))),
+        )
+        if garment_bounds is not None
+        else (0, 0, w, h)
+    )
+    sx1, sx2 = max(gx1, px.x1 - int(pad_ratio * w)), min(gx2, px.x2 + int(pad_ratio * w))
+    sy1, sy2 = max(gy1, px.y1 - int(pad_ratio * h)), min(gy2, px.y2 + int(pad_ratio * h))
     patch = image_rgb[sy1:sy2, sx1:sx2].astype(np.float32)
     if patch.shape[0] < 16 or patch.shape[1] < 16:
         return None
 
-    fg_mask = (
-        np.linalg.norm(patch - bg_med.reshape(1, 1, 3), axis=2)
-        > heuristics.bg_color_distance_threshold
-    )
+    fg_mask = _compute_foreground_mask(patch, bg_med, heuristics.bg_color_distance_threshold)
     if int(np.count_nonzero(fg_mask)) < 100:
         return None
     cloth_med = np.median(patch[fg_mask], axis=0)
@@ -450,19 +490,19 @@ def find_salient_emblem_box(
         ):
             continue
         bw, bh = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
-        if max(bw / max(1.0, float(bh)), bh / max(1.0, float(bw))) > 3.0:
+        if max(bw / max(1.0, float(bh)), bh / max(1.0, float(bw))) > _EMBLEM_MAX_ASPECT:
             continue
         score = float(count) * float(diff[pts].mean())
         if score > best_score:
             best_score = score
             nx1, ny1 = (sx1 + int(xs.min())) / float(w), (sy1 + int(ys.min())) / float(h)
             nx2, ny2 = (sx1 + int(xs.max())) / float(w), (sy1 + int(ys.max())) / float(h)
-            if nx2 - nx1 >= 0.02 or ny2 - ny1 >= 0.02:
+            if nx2 - nx1 >= _MIN_BOX_SPAN_NORM or ny2 - ny1 >= _MIN_BOX_SPAN_NORM:
                 best_box = NormalizedBox(
                     round(max(0.0, nx1), 4),
                     round(max(0.0, ny1), 4),
-                    round(min(1.0, max(nx1 + 0.02, nx2)), 4),
-                    round(min(1.0, max(ny1 + 0.02, ny2)), 4),
+                    round(min(1.0, max(nx1 + _MIN_BOX_SPAN_NORM, nx2)), 4),
+                    round(min(1.0, max(ny1 + _MIN_BOX_SPAN_NORM, ny2)), 4),
                 )
     return best_box
 
@@ -498,34 +538,78 @@ def emblem_pattern_correlation(
     return float(np.corrcoef(pm.ravel(), pr.ravel())[0, 1])
 
 
+def _map_relative_zone(
+    bounds: tuple[float, float, float, float], u1: float, v1: float, u2: float, v2: float
+) -> NormalizedBox | None:
+    bx1, by1, bx2, by2 = bounds
+    span_x = bx2 - bx1
+    span_y = by2 - by1
+    x1 = max(0.0, min(1.0, bx1 + u1 * span_x))
+    y1 = max(0.0, min(1.0, by1 + v1 * span_y))
+    x2 = max(0.0, min(1.0, bx1 + u2 * span_x))
+    y2 = max(0.0, min(1.0, by1 + v2 * span_y))
+    if x2 - x1 < _MIN_BOX_SPAN_NORM or y2 - y1 < _MIN_BOX_SPAN_NORM:
+        return None
+    return NormalizedBox(x1, y1, x2, y2)
+
+
+def _build_garment_scan_zones(
+    model_rgb: NDArray[np.uint8],
+    ref_rgb: NDArray[np.uint8],
+    heuristics: HeuristicConfig,
+) -> tuple[
+    list[tuple[NormalizedBox, NormalizedBox]],
+    tuple[float, float, float, float] | None,
+    tuple[float, float, float, float] | None,
+]:
+    """Build garment-silhouette-relative 3x3 zone pairs (or interior full-frame fallback)."""
+    seg = segment_garment_bounds(model_rgb, ref_rgb, heuristics=heuristics)
+    if seg is None:
+        m_bounds: tuple[float, float, float, float] | None = None
+        r_bounds: tuple[float, float, float, float] | None = None
+        eval_m_bounds = (0.15, 0.15, 0.85, 0.85)
+        eval_r_bounds = (0.15, 0.15, 0.85, 0.85)
+    else:
+        r_bounds, m_bounds, _, _, _ = seg
+        eval_m_bounds = m_bounds
+        eval_r_bounds = r_bounds
+
+    pairs: list[tuple[NormalizedBox, NormalizedBox]] = []
+    for (v1, v2), (u1, u2) in itertools.product(_GARMENT_GRID_V, _GARMENT_GRID_U):
+        mz = _map_relative_zone(eval_m_bounds, u1, v1, u2, v2)
+        rz = _map_relative_zone(eval_r_bounds, u1, v1, u2, v2)
+        if mz is not None and rz is not None:
+            pairs.append((mz, rz))
+    return pairs, m_bounds, r_bounds
+
+
 def detect_micro_emblem_defect(
     model_rgb: NDArray[np.uint8],
     ref_rgb: NDArray[np.uint8],
     source_label: str,
     heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
 ) -> tuple[str, NormalizedBox, NormalizedBox, str] | None:
-    """Detect small emblem mismatches across general garment zones.
+    """Detect small emblem mismatches dynamically across garment-interior zones.
 
     Returns (defect_summary, model_box, ref_box, edit_prompt) or None if intact.
     """
-    candidate_zones = (
-        NormalizedBox(0.50, 0.26, 0.68, 0.46),
-        NormalizedBox(0.32, 0.26, 0.50, 0.46),
-        NormalizedBox(0.41, 0.22, 0.59, 0.44),
-        NormalizedBox(0.28, 0.22, 0.48, 0.44),
-        NormalizedBox(0.52, 0.22, 0.72, 0.44),
-    )
     _ = source_label
+    zone_pairs, m_bounds, r_bounds = _build_garment_scan_zones(model_rgb, ref_rgb, heuristics)
     best_match: tuple[float, NormalizedBox, NormalizedBox] | None = None
-    for zone in candidate_zones:
-        m_emblem = find_salient_emblem_box(model_rgb, zone, heuristics=heuristics)
-        r_emblem = find_salient_emblem_box(ref_rgb, zone, heuristics=heuristics)
+    for m_zone, r_zone in zone_pairs:
+        m_emblem = find_salient_emblem_box(
+            model_rgb, m_zone, heuristics=heuristics, garment_bounds=m_bounds
+        )
+        r_emblem = find_salient_emblem_box(
+            ref_rgb, r_zone, heuristics=heuristics, garment_bounds=r_bounds
+        )
         if m_emblem is None or r_emblem is None:
             continue
         corr = emblem_pattern_correlation(model_rgb, m_emblem, ref_rgb, r_emblem)
-        if corr < heuristics.emblem_correlation_threshold:
+        if corr < heuristics.emblem_correlation_threshold and (
+            best_match is None or corr < best_match[0]
+        ):
             best_match = (corr, m_emblem, r_emblem)
-            break
 
     if best_match is None:
         return None
@@ -557,5 +641,6 @@ def detect_micro_emblem_defect(
         "from <image2>, restoring all fine geometric details, internal cutouts, and "
         "typography to match <image2> in position and size."
     )
-    summary = f"Small chest emblem structural mismatch detected (corr={corr:.2f})"
+    zone_label = "chest emblem" if m_cy < 0.50 else "garment emblem"
+    summary = f"Small {zone_label} structural mismatch detected (corr={corr:.2f})"
     return summary, model_box, ref_box, prompt

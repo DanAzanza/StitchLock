@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,11 +41,6 @@ class ComfyInstance:
     extra_model_paths: Path | None = None
     extra_args: tuple[str, ...] = ()
     gui_exe: Path | None = None
-
-
-_SPAWNED_PROCESS: subprocess.Popen[Any] | None = None
-_SPAWNED_SERVER_URL: str | None = None
-_ATEXIT_REGISTERED = False
 
 
 def get_desktop_appdata_dir() -> Path | None:
@@ -327,26 +323,22 @@ def _spawn_instance(instance: ComfyInstance, host: str, port: str) -> subprocess
     raise ComfyExecutionError(f"Unsupported ComfyUI instance mode: '{instance.mode}'.")
 
 
-def stop_auto_started_server() -> None:
-    """Cleanly unload VRAM and stop the ComfyUI server spawned by this process."""
-    global _SPAWNED_PROCESS, _SPAWNED_SERVER_URL
-    proc = _SPAWNED_PROCESS
-    server_url = _SPAWNED_SERVER_URL
-    _SPAWNED_PROCESS = None
-    _SPAWNED_SERVER_URL = None
-
-    if server_url and is_comfy_server_online(server_url, timeout=1.0):
-        with contextlib.suppress(requests.RequestException, OSError):
-            requests.post(f"{server_url}/interrupt", timeout=2.0)
-        with contextlib.suppress(requests.RequestException, OSError):
-            requests.post(
-                f"{server_url}/free",
-                json={"unload_models": True, "free_memory": True},
-                timeout=3.0,
-            )
-
-    if proc is None or proc.poll() is not None:
+def _free_server_vram(server_url: str) -> None:
+    """Ask a live ComfyUI server to interrupt queued work and release VRAM."""
+    if not is_comfy_server_online(server_url, timeout=1.0):
         return
+    with contextlib.suppress(requests.RequestException, OSError):
+        requests.post(f"{server_url}/interrupt", timeout=2.0)
+    with contextlib.suppress(requests.RequestException, OSError):
+        requests.post(
+            f"{server_url}/free",
+            json={"unload_models": True, "free_memory": True},
+            timeout=3.0,
+        )
+
+
+def _terminate_process_tree(proc: subprocess.Popen[Any]) -> None:
+    """Terminate an owned subprocess and its descendants using OS-appropriate teardown."""
     if sys.platform == "win32":
         with contextlib.suppress(OSError):
             subprocess.run(
@@ -370,53 +362,159 @@ def stop_auto_started_server() -> None:
         proc.wait(timeout=4.0)
 
 
-def ensure_comfyui_server(config: ComfyConfig, startup_timeout: float = 90.0) -> str:
-    """Return a live ComfyUI URL, auto-launching a detected installation if configured."""
-    global _SPAWNED_PROCESS, _SPAWNED_SERVER_URL, _ATEXIT_REGISTERED
+def _stop_detached(proc: subprocess.Popen[Any] | None, server_url: str | None) -> None:
+    """Free VRAM and terminate a detached server process without holding manager locks."""
+    if server_url:
+        _free_server_vram(server_url)
+    if proc is not None and proc.poll() is None:
+        _terminate_process_tree(proc)
 
-    active = probe_candidate_servers(config)
-    if active is not None:
-        return active
 
-    if not config.auto_launch:
+class ComfyServerManager:
+    """Thread-safe lifecycle manager for an auto-started local ComfyUI process."""
+
+    def __init__(self, *, register_atexit: bool = True) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[Any] | None = None
+        self._server_url: str | None = None
+        self._register_atexit = register_atexit
+        self._atexit_registered = False
+
+    @property
+    def server_url(self) -> str | None:
+        """Return the active spawned server URL, if managed by this instance."""
+        with self._lock:
+            return self._server_url
+
+    @property
+    def process(self) -> subprocess.Popen[Any] | None:
+        """Return the active spawned subprocess handle, if managed by this instance."""
+        with self._lock:
+            return self._process
+
+    def _clear_process_if_current(self, proc: subprocess.Popen[Any]) -> bool:
+        with self._lock:
+            if self._process is not proc:
+                return False
+            self._process = None
+            self._server_url = None
+            return True
+
+    def _detach_stale_process(
+        self, target_url: str
+    ) -> tuple[subprocess.Popen[Any] | None, str | None]:
+        """Detach any live managed process belonging to a different target URL."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return None, None
+            if self._server_url == target_url:
+                return None, None
+            stale_proc = self._process
+            stale_url = self._server_url
+            self._process = None
+            self._server_url = None
+            return stale_proc, stale_url
+
+    def _register_shutdown_hook_if_needed(self) -> None:
+        if self._register_atexit and not self._atexit_registered:
+            atexit.register(self.stop)
+            self._atexit_registered = True
+
+    def _await_server_ready(
+        self,
+        instance: ComfyInstance,
+        proc: subprocess.Popen[Any],
+        target_url: str,
+        startup_timeout: float,
+    ) -> str:
+        deadline = time.monotonic() + startup_timeout
+        while time.monotonic() < deadline:
+            if is_comfy_server_online(target_url, timeout=1.5):
+                LOGGER.info("ComfyUI server is online at %s.", target_url)
+                return target_url
+            if proc.poll() is not None and instance.mode == "headless":
+                self._clear_process_if_current(proc)
+                raise ComfyExecutionError(
+                    f"Auto-started ComfyUI ({instance.name}) exited prematurely with code "
+                    f"{proc.returncode}."
+                )
+            time.sleep(1.0)
+
+        if (
+            instance.mode == "headless"
+            and self._clear_process_if_current(proc)
+            and proc.poll() is None
+        ):
+            _terminate_process_tree(proc)
         raise ComfyExecutionError(
-            "ComfyUI server is offline and auto_launch is disabled. "
-            f"Checked {config.server_url} and ports {list(config.fallback_ports)}. "
-            "Recovery: Start ComfyUI manually or set comfyui.auto_launch: true in config.yaml."
+            f"ComfyUI ({instance.name}) did not respond at {target_url} within "
+            f"{int(startup_timeout)}s."
         )
 
-    instance = detect_comfyui()
-    if instance is None:
-        raise ComfyExecutionError(
-            "ComfyUI server is offline and no local ComfyUI Desktop or standalone "
-            "installation was detected. Recovery: Install/start ComfyUI or set COMFYUI_DIR."
-        )
+    def stop(self) -> None:
+        """Cleanly unload VRAM and stop the ComfyUI server owned by this manager."""
+        with self._lock:
+            proc = self._process
+            server_url = self._server_url
+            self._process = None
+            self._server_url = None
 
-    target_url = config.server_url.rstrip("/")
-    parsed = urlparse(target_url)
-    host = parsed.hostname or "127.0.0.1"
-    port = str(parsed.port or 8000)
+        _stop_detached(proc, server_url)
 
-    LOGGER.info("Auto-starting ComfyUI (%s) on %s...", instance.name, target_url)
-    proc = _spawn_instance(instance, host, port)
-    _SPAWNED_PROCESS = proc
-    _SPAWNED_SERVER_URL = target_url
-    if not _ATEXIT_REGISTERED:
-        atexit.register(stop_auto_started_server)
-        _ATEXIT_REGISTERED = True
+    def ensure_server(self, config: ComfyConfig, startup_timeout: float = 90.0) -> str:
+        """Return a live ComfyUI URL, auto-launching a detected installation if configured."""
+        active = probe_candidate_servers(config)
+        if active is not None:
+            return active
 
-    deadline = time.monotonic() + startup_timeout
-    while time.monotonic() < deadline:
-        if is_comfy_server_online(target_url, timeout=1.5):
-            LOGGER.info("ComfyUI server is online at %s.", target_url)
-            return target_url
-        if proc.poll() is not None and instance.mode == "headless":
+        if not config.auto_launch:
             raise ComfyExecutionError(
-                f"Auto-started ComfyUI ({instance.name}) exited prematurely with code "
-                f"{proc.returncode}."
+                "ComfyUI server is offline and auto_launch is disabled. "
+                f"Checked {config.server_url} and ports {list(config.fallback_ports)}. "
+                "Recovery: Start ComfyUI manually or set comfyui.auto_launch: true in config.yaml."
             )
-        time.sleep(1.0)
 
-    raise ComfyExecutionError(
-        f"ComfyUI ({instance.name}) did not respond at {target_url} within {int(startup_timeout)}s."
-    )
+        instance = detect_comfyui()
+        if instance is None:
+            raise ComfyExecutionError(
+                "ComfyUI server is offline and no local ComfyUI Desktop or standalone "
+                "installation was detected. Recovery: Install/start ComfyUI or set COMFYUI_DIR."
+            )
+
+        target_url = config.server_url.rstrip("/")
+        parsed = urlparse(target_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = str(parsed.port or 8000)
+
+        stale_proc, stale_url = self._detach_stale_process(target_url)
+        if stale_proc is not None:
+            _stop_detached(stale_proc, stale_url)
+
+        with self._lock:
+            if (
+                self._process is not None
+                and self._process.poll() is None
+                and self._server_url == target_url
+            ):
+                proc = self._process
+            else:
+                LOGGER.info("Auto-starting ComfyUI (%s) on %s...", instance.name, target_url)
+                proc = _spawn_instance(instance, host, port)
+                self._process = proc
+                self._server_url = target_url
+                self._register_shutdown_hook_if_needed()
+
+        return self._await_server_ready(instance, proc, target_url, startup_timeout)
+
+
+_DEFAULT_MANAGER = ComfyServerManager()
+
+
+def stop_auto_started_server() -> None:
+    """Cleanly unload VRAM and stop the ComfyUI server spawned by the default manager."""
+    _DEFAULT_MANAGER.stop()
+
+
+def ensure_comfyui_server(config: ComfyConfig, startup_timeout: float = 90.0) -> str:
+    """Return a live ComfyUI URL via the default manager."""
+    return _DEFAULT_MANAGER.ensure_server(config, startup_timeout=startup_timeout)
