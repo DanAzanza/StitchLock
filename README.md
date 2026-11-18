@@ -5,7 +5,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![CI Quality Gate](https://img.shields.io/badge/CI-Ruff%20%7C%20Pyright%20%7C%20Pytest-brightgreen.svg)](.github/workflows/ci.yml)
 [![ComfyUI API](https://img.shields.io/badge/ComfyUI-REST%20%2F%20WebSocket-orange.svg)](workflows/qwen_2_1_edit_api.json)
-[![Architecture: DiT](https://img.shields.io/badge/Model-Qwen--Image%202.1%20Edit-purple.svg)](docs/ARCHITECTURE.md)
+[![Architecture: DiT](https://img.shields.io/badge/Model-Qwen--Image%202.1%20Edit-purple.svg)](.agents/PROJECT.md)
 [![Pixel-Lock](https://img.shields.io/badge/Pixel--Lock-Unmasked%20RGB%20Verified-success.svg)](src/verifier.py)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](pyproject.toml)
 
@@ -18,10 +18,10 @@ When generating On-Model lookbook imagery from e-commerce product packshots, gen
 Passing the entire image through another diffusion pass degrades skin texture, alters facial identity, and shifts background pixels due to lossy VAE encode/decode cycles.
 
 **StitchLocker (`garment-fix-pipeline`)** solves this with **zero manual intervention**:
-1. **Stage 0 — Qwen3-VL-8B Multi-Defect Inspector & Visual Grounding (`src/vlm_inspector.py` & `src/vlm_heuristics.py`)**: Uses ComfyUI's built-in `TextGenerateV2` node on the shared `qwen3vl_8b_int8_convrot.safetensors` checkpoint (0 MB extra VRAM) to verify whether garment logos/text are defective (`has_defect`), localize one or multiple separated defects (`model_bbox_2d` & `ref_bbox_2d`, with overlap deduplication and solo-image contrast re-grounding), and generate direct imperative `edit_prompt`s.
+1. **Stage 0 — Qwen3-VL-8B Multi-Defect Inspector & Visual Grounding (`src/vlm_inspector.py` & `src/vlm_heuristics.py`)**: Uses ComfyUI's built-in `TextGenerateV2` node on the shared `qwen3vl_8b_int8_convrot.safetensors` checkpoint (0 MB extra VRAM) to verify whether garment logos/text are defective (`has_defect`), localize one or multiple separated defects (`model_bbox_2d` & `ref_bbox_2d`, with overlap deduplication, border-connected backdrop segmentation, dynamic garment-relative 3×3 micro-emblem scanning, and solo-image contrast re-grounding), and generate direct imperative `edit_prompt`s.
 2. **Stage 1 — Full-Frame Masking & Reference Garment Alignment (`src/auto_masker.py`)**: Builds a resolution-relative, interior-feathered full-image mask around each localized defect while preserving the native On-Model resolution/aspect ratio and aligning the full Product Reference garment frame per defect (so `Qwen-Image 2.1` sees all logos and exact garment-to-logo proportions).
 3. **Stage 2 — Sequential Multi-Defect Qwen-Image 2.1 Edit (`src/comfy_client.py`)**: Executes a 14-node headless **ComfyUI Qwen-Image 2.1 (`ImageScaleToTotalPixels` + `TextEncodeQwenImage21` + `VAEEncode` + `SetLatentNoiseMask`)** workflow sequentially per detected defect on full native-aspect frames and greyscale masks, scaling to ~1.0 MP (`32px`-aligned) inside ComfyUI to replace oversized/hallucinated logos in true 1:1 garment proportion while anchoring unmasked pose and fabric.
-4. **Stage 3 & 4 — Strict Pixel-Lock Compositor & Automated Verification Gate (`src/compositor.py` & `src/verifier.py`)**: Composites each repaired region using perimeter VAE color-shift compensation and interior distance-transform feathering, then enforces a hard NumPy pixel lock outside the union mask in the decoded 8-bit RGB buffer (`unmasked_max_abs_diff == 0`, 2D Gaussian-windowed `unmasked_ssim == 1.0000`), verifies masked-region non-degeneracy and reference similarity (`masked_reference_similarity`), preserves source ICC color profiles and RGBA alpha channels on lossless PNG export, and renders a 4-panel visual report.
+4. **Stage 3 & 4 — Strict Pixel-Lock Compositor & Automated Verification Gate (`src/compositor.py` & `src/verifier.py`)**: Composites each repaired region using perimeter VAE color-shift compensation and interior distance-transform feathering, then enforces a hard NumPy pixel lock outside the union mask in the decoded 8-bit RGB buffer (`unmasked_max_abs_diff == 0`, 2D Gaussian-windowed `unmasked_ssim == 1.0000`), verifies masked-region non-degeneracy and calibrated `128×128` salient-cropped reference similarity (`masked_reference_similarity`), supports opt-in fail-closed VLM post-checks (`enable_vlm_post_check`), preserves source ICC color profiles and RGBA alpha channels on lossless PNG export, and renders a 4-panel visual report.
 
 ---
 
@@ -60,7 +60,7 @@ All showcase cases use **100% synthetic, trademark-free studio assets** (front p
 ## 1. What I Built (Architecture & 5-Stage Pipeline)
 
 > [!NOTE]
-> For mathematical derivations of the Interior Distance-Transform Feathering, Rectified Flow Matching ODE dynamics, and Zero-Recompression PNG Provenance chunks, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> For mathematical derivations of the Interior Distance-Transform Feathering, Rectified Flow Matching ODE dynamics, and Zero-Recompression PNG Provenance chunks, see [.agents/PROJECT.md](.agents/PROJECT.md).
 
 ```mermaid
 sequenceDiagram
@@ -111,10 +111,9 @@ StitchLocker/
 ├── run_pipeline.sh                     # Linux/macOS 1-Click Artist Studio UI launcher (auto ComfyUI lifecycle)
 ├── setup_test_cases.py                 # Ensures flat `<name>.png` + `<name>_reference.png` fixtures exist
 ├── run_batch.py                        # Zero-touch CLI batch runner (fails fast if ComfyUI offline)
-├── app.py                              # Gradio 5.0+ 2-Column Artist Studio UI with `+ Add Look` pop-up
+├── app.py                              # Gradio 6.0+ 2-Column Artist Studio UI with `+ Add Look` pop-up
 ├── docs/
-│   ├── ARCHITECTURE.md                 # Deep mathematical & systems architecture reference
-│   └── assets/                         # Artist Studio UI screenshots for documentation
+│   └── assets/                         # Artist Studio UI & verification showcase screenshots
 ├── workflows/
 │   ├── qwen3_vl_inspector_api.json     # ComfyUI API graph for Qwen3-VL-8B defect detection
 │   └── qwen_2_1_edit_api.json          # 14-node ComfyUI graph (ImageScaleToTotalPixels + TextEncodeQwenImage21 + SetLatentNoiseMask)
@@ -122,20 +121,21 @@ StitchLocker/
 │   └── run_ci_locally.py               # Local CI Quality Gate runner (Ruff + Formatter + Pyright + Pytest)
 ├── src/
 │   ├── models.py                       # Immutable domain dataclasses, config loader & path safety guards
-│   ├── vlm_heuristics.py               # Configurable CV box refinement, shift-splitting & micro-emblem heuristics
-│   ├── vlm_inspector.py                # Stage 0: Qwen3-VL-8B defect detection & visual grounding
+│   ├── vlm_heuristics.py               # Configurable CV box refinement, 3x3 garment scan & shift-splitting heuristics
+│   ├── vlm_inspector.py                # Stage 0: Qwen3-VL-8B defect inspection, grounding & opt-in post-check
 │   ├── auto_masker.py                  # Stage 1: Full-frame mask & reference alignment engine
 │   ├── comfy_client.py                 # Stage 2: Shared headless ComfyUI WebSocket/HTTP transport & Edit bridge
-│   ├── comfy_launcher.py               # Automatic ComfyUI Desktop/standalone startup & cleanup
+│   ├── comfy_launcher.py               # Thread-safe ComfyServerManager for ComfyUI Desktop/standalone startup & cleanup
 │   ├── compositor.py                   # Stage 3: Lanczos stitching & strict NumPy pixel-lock compositor
 │   ├── fixtures.py                     # Deterministic procedural test case fixture generator
-│   ├── verifier.py                     # Stage 4: 2D SSIM + Pixel-Lock & masked similarity gate + 4-panel renderer
+│   ├── verifier.py                     # Stage 4: 2D SSIM, Sobel edge-NCC similarity, Pixel-Lock gate & 4-panel renderer
 │   ├── metadata.py                     # Zero-recompression PNG tEXt provenance chunk processor (IDAT-preserving)
 │   ├── housekeeper.py                  # Safe local ComfyUI intermediate asset cleanup with NTFS lock retries
-│   ├── ui_handlers.py                  # Pure Gradio Studio service handlers & BrowserSessionLifecycle
+│   ├── ui_handlers.py                  # Inbox, batch & BrowserSessionLifecycle handlers for Gradio Studio
+│   ├── ui_custom_handlers.py           # Custom upload, interactive VLM box overlay & ROI preview handlers
 │   ├── ui_style.css                    # Full-height 2-column & modal overlay Artist Studio styling
 │   ├── ci.py                           # Multi-stage local CI verification orchestrator
-│   └── pipeline.py                     # End-to-end orchestrator with ICC/RGBA preservation & atomic .part writes
+│   └── pipeline.py                     # End-to-end orchestrator with shared VLM post-check & atomic .part writes
 ├── test_cases/
 │   ├── kova_zip_jacket.png             # Synthetic Case 1: On-Model photo (defect)
 │   ├── kova_zip_jacket_reference.png   # Synthetic Case 1: Authentic front product reference
@@ -146,9 +146,10 @@ StitchLocker/
 │   └── _reports/                       # 4-panel verification PNGs, diff heatmaps (`_diff_heatmap_x4.png`) & JSONs
 └── tests/
     ├── test_core_and_masker.py         # Models, config, case discovery, AutoMasker & ICC/RGBA round-trip tests
-    ├── test_comfy_and_vlm.py           # ComfyUI bridge, VLM parsing, heuristics, housekeeper & launcher tests
+    ├── test_comfy_and_vlm.py           # ComfyUI bridge, VLM parsing, heuristics, housekeeper & ComfyServerManager tests
     ├── test_pipeline_and_ui.py         # Compositor, 2D SSIM verifier, metadata, pipeline & Studio UI tests
-    └── test_generalization.py          # 8-case holdout generalization suite across garments, ratios & defect types
+    ├── test_verifier_and_post_check.py # Typography SSIM/Sobel discrimination & fail-closed VLM post-check tests
+    └── test_generalization.py          # 10-case holdout generalization + real studio asset verification suite
 ```
 
 ---
@@ -173,8 +174,8 @@ We enforce unmasked preservation and masked-region quality through three complem
    ```
    Every pixel where `binary_mask == 0` is copied directly from the untouched `original_image` RGB buffer in memory (`unmasked_max_abs_diff = 0`, `0.0000%` alteration relative to the decoded 8-bit RGB input). On lossless PNG export, `src/pipeline.py` also re-attaches the original image's ICC color profile (`icc_profile`) and untouched RGBA alpha channel when present (inputs using 16-bit depth or lossy JPEG source compression are normalized to 8-bit RGB/RGBA PNGs).
 
-3. **2D Windowed SSIM & Masked-Region Verification (`src/verifier.py`)**:
-   `PixelLockVerifier` validates unmasked integrity using 2D Gaussian-windowed SSIM ($11 \times 11, \sigma = 1.5$, isolated on an unmasked canvas to prevent boundary bleed) and checks the *masked* region for non-degeneracy (rejecting blackouts or flat collapses) and structural/chromatic similarity against the aligned reference crop (`masked_reference_similarity >= min_masked_similarity`).
+3. **2D Windowed SSIM, Calibrated Masked Similarity & Opt-In VLM Post-Check (`src/verifier.py`, `src/vlm_inspector.py`)**:
+   `PixelLockVerifier` validates unmasked integrity using 2D Gaussian-windowed SSIM ($11 \times 11, \sigma = 1.5$, isolated on an unmasked canvas to prevent boundary bleed) and checks the *masked* region for non-degeneracy (rejecting blackouts or flat collapses), plain-cloth `ERASE` uniformity, and `128×128` salient-cropped 2D SSIM + Sobel edge-gradient NCC similarity against the aligned reference crop (`masked_reference_similarity >= min_masked_similarity`), optionally backed by a fail-closed `Qwen3-VL` semantic/OCR post-check (`enable_vlm_post_check`).
 
 4. **Zero-Recompression PNG Provenance Metadata (`src/metadata.py`)**:
    To support EU AI Act Article 50 transparency workflows without re-encoding `IDAT` pixel streams, `embed_png_provenance_metadata` injects `tEXt` audit chunks (`Software`, `AI-Generated`, `AI-Compliance`, `Pixel-Lock-Verified`, etc.) directly before `IEND`. PNG `tEXt` chunks are non-cryptographic metadata (distinct from cryptographic C2PA manifests or imperceptible watermarks) and can be stripped by downstream re-encoders.

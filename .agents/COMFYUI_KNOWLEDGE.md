@@ -1,11 +1,11 @@
-# ComfyUI_KNOWLEDGE.md — ComfyUI & Qwen-Image 2.1 Platform Memory
+# COMFYUI_KNOWLEDGE.md — ComfyUI & Qwen-Image 2.1 Platform Memory
 
 ## 1. Local Hardware & Server Environment
 - **GPU Hardware**: CUDA 0 — NVIDIA GeForce RTX 4060 Ti (16 GB VRAM).
 - **Server Endpoints**:
   - Standalone ComfyUI default: `http://127.0.0.1:8188`
   - Comfy Desktop headless default: `http://127.0.0.1:8000`
-  - `ComfyQwenBridge` automatically probes `server_url` and `fallback_ports: [8188, 8000]`.
+  - Headless clients probe `server_url` and fallback ports `[8000, 8188]`.
 - **Shared Model Storage (`C:\Users\danie\ComfyUI-Shared\models`)**:
   - Diffusion Transformer (UNET): `diffusion_models/qwen_image_2.1_int8_convrot.safetensors`
   - Text/Vision Encoder (CLIP): `text_encoders/qwen3vl_8b_int8_convrot.safetensors` (`type: "qwen_image"`)
@@ -33,21 +33,18 @@
 
 ---
 
-## 3. Qwen-Image 2.1 DiT & 4-Channel VAE Quirks
+## 3. Qwen-Image 2.1 DiT, Qwen3-VL-8B & 4-Channel VAE Quirks
 - **4-Channel VAE Alpha Channel Quirk (Strict Greyscale Mask Requirement)**:
   - Passing an RGBA image with an embedded alpha mask into `LoadImage` $\rightarrow$ `TextEncodeQwenImage21` causes Qwen-Image 2.1's 4-channel VAE to interpret transparent border pixels as dark/black color shifts around the inpaint boundary.
-  - **Mandatory Workaround**: Upload `cropped_model_roi.png` and `cropped_product_ref.png` strictly as 3-channel `RGB` PNGs, and upload `cropped_mask.png` strictly as a single-channel 8-bit greyscale (`mode="L"`) PNG routed through `ImageToMask (channel="red")` $\rightarrow$ `SetLatentNoiseMask`.
+  - **Mandatory Workaround**: Upload input and reference images strictly as 3-channel `RGB` PNGs, and upload inpaint masks strictly as single-channel 8-bit greyscale (`mode="L"`) PNGs routed through `ImageToMask (channel="red")` $\rightarrow$ `SetLatentNoiseMask`.
 - **Rectified Flow Matching Sampler & Native `CFG = 1.0`**:
-  - Qwen-Image 2.1 uses straight-line Rectified Flow trajectories (`sampler_name: "euler"`, `scheduler: "simple"`, `steps: 20`, `denoise: 1.0`).
-  - Keep `cfg: 1.0` and `negative_prompt: ""`. Raising `CFG > 1.5` triggers multimodal cross-attention crosstalk where studio packshot backgrounds from `<image2>` contaminate the surrounding garment in `<image1>`.
+  - Qwen-Image 2.1 is trained under the Rectified Flow Matching objective ($\frac{dX_t}{dt} = v_\theta(X_t, t, c)$, $X_t = (1 - t)X_0 + tX_1$) and uses straight-line Euler integration (`sampler_name: "euler"`, `scheduler: "simple"`, `steps: 20`, `denoise: 1.0`).
+  - Keep `cfg: 1.0` and `negative_prompt: ""`. Raising `CFG > 1.5` in dual-image conditioning triggers multimodal cross-attention crosstalk where studio packshot backgrounds from `<image2>` bleed into `<image1>`.
 - **Shared Qwen3-VL-8B Text/Vision Encoder (`TextGenerateV2`)**:
-  - `workflows/qwen3_vl_inspector_api.json` reuses `qwen3vl_8b_int8_convrot.safetensors` inside ComfyUI (`sampling_mode: "off"`, captured via `PreviewAny`) with zero extra VRAM overhead.
-  - Both VLM inspection and `Qwen-Image 2.1 Edit` strictly fail fast with `ComfyExecutionError` when ComfyUI is offline (no offline/OpenCV fallbacks).
-- **`TextEncodeQwenImage21` + `VAEEncode` + `SetLatentNoiseMask` Architecture**:
-  - `TextEncodeQwenImage21` (`comfy_extras/nodes_qwen.py`) returns an all-zero latent tensor (`torch.zeros`) while injecting `image_1` and `image_2` into `reference_latents`. Connecting `SetLatentNoiseMask` onto that zero latent leaves unmasked regions as solid grey/black.
-  - Therefore, `workflows/qwen_2_1_edit_api.json` encodes `<image1>` via `VAEEncode(pixels=["1", 0], vae=["5", 0])` and wires `ImageToMask(image=["10", 0], channel="red")` -> `SetLatentNoiseMask` -> `KSampler (denoise=1.0)` on full `1024x1024` garment frames so unmasked pose/identity/logos stay anchored while `Qwen-Image 2.1` sees full garment proportions from `<image2>`.
-- **Bypassing Full-Frame VAE Reconstruction Drift**:
-  - Even with a latent noise mask (`SetLatentNoiseMask`), decoding the latent tensor through `VAEDecode` slightly alters pixel intensities (`16x` spatial block boundaries).
-  - Therefore, the ComfyUI output must **never** be used directly as the final image; it must always pass through Stage 3 (`PixelLockCompositor`) where perimeter VAE offset compensation, interior distance-transform feathering, and `np.where(binary_mask[..., None] > 0, blended_image, original_image)` restore bit-identical unmasked pixels.
-- **VLM Erase-Before-Insert Ordering**:
-  - When a misplaced graphic requires two sequential passes (erase misplaced spot + insert authentic detail at correct garment coordinates), `Qwen3VLInspector` sorts `_is_erase_defect` passes first and skips `_locate_ref_detail_single_image` on pure erase passes (since their `<image2>` target is plain cloth, not a contrasting emblem).
+  - ComfyUI's `TextGenerateV2` node reuses `qwen3vl_8b_int8_convrot.safetensors` (`sampling_mode: "off"`, captured via `PreviewAny`) with zero extra VRAM overhead when paired with Qwen-Image 2.1.
+- **`TextEncodeQwenImage21` + `VAEEncode` + `SetLatentNoiseMask` Graph Topology**:
+  - `TextEncodeQwenImage21` (`comfy_extras/nodes_qwen.py`) outputs an all-zero latent tensor (`torch.zeros`) while injecting `image_1` and `image_2` into `reference_latents`. Wiring `SetLatentNoiseMask` onto that zero latent leaves unmasked regions as solid grey/black.
+  - Encode `<image1>` via `VAEEncode(pixels, vae)` first and wire `ImageToMask(channel="red")` $\rightarrow$ `SetLatentNoiseMask` $\rightarrow$ `KSampler (denoise=1.0)` so unmasked latent tokens remain anchored to `<image1>`.
+- **ViT Token Grid (`28x28 px`) & `8x` VAE Latent Bottleneck on Small Details**:
+  - At `1024x1024` full-frame scale (`ImageScaleToTotalPixels` at `1.0 MP`), `Qwen3-VL-8B`'s merged ViT patch grid (`28x28 px` per visual token) compresses a `~25–35 px` chest emblem into a single visual token, and `Qwen-Image 2.1`'s `8x` VAE downsampling reduces it to `~3x4` latent cells (with `VAEDecode` still introducing slight reconstruction drift of `2–18` RGB levels across `16x` block boundaries).
+  - Resolving fine internal cutouts or `6 px`-tall typography requires cropping a local sub-region (`256x256`) around the target before `ImageScaleToTotalPixels (1.0 MP)` (`4x` effective latent supersampling) and compositing the decoded result back into the original frame outside ComfyUI.

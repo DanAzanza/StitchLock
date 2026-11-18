@@ -7,6 +7,9 @@
 - **Event Handler Annotations under `from __future__ import annotations`**:
   - Gradio inspects runtime `__annotations__` to inject `gr.SelectData` payloads for `.select(...)` callbacks (e.g. `gr.Gallery.select`).
   - Assign `handler.__annotations__ = {"evt": gr.SelectData}` directly on the inner handler (without wrapping it in `@wraps` or adding stringified return annotations) to avoid `UserWarning` or skipped injection.
+- **Deferred Theme/UI Import & Unbuffered Console Feedback (`python -u`)**:
+  - Importing `gradio` (`from gradio.themes import Soft` / `import gradio as gr`) loads hundreds of submodules and can take `~9s` on local SSDs (or `~80s` on virtual/cloud mounts).
+  - Defer importing Gradio until *after* CLI argument parsing, config loading, and fast backend healthchecks/auto-start, and launch entrypoints with `python -u` (`flush=True`) so users see immediate startup progress.
 
 ---
 
