@@ -9,7 +9,7 @@ description = "Automated E-Commerce Garment Detail Correction Pipeline with Math
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Daniel" }]
+authors = [{ name = "Daniel Azanza Hartmann" }]
 dependencies = [
     "numpy>=1.26.0",
     "opencv-python-headless>=4.9.0",
