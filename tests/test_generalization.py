@@ -1,23 +1,38 @@
-"""8-Case Holdout Generalization Suite Across Diverse Garments, Ratios, and Defect Types."""
+"""10-Case Holdout Generalization & Real Studio Asset Suite."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 from PIL import Image
+from src.auto_masker import AutoMasker
 from src.comfy_client import ComfyQwenBridge
+from src.compositor import PixelLockCompositor
 from src.models import (
+    CaseManifest,
     ComfyConfig,
+    MaskingConfig,
+    MaskingStrategy,
     PipelineConfig,
+    PixelBBox,
+    VerificationConfig,
     load_pipeline_config,
 )
-from src.pipeline import GarmentCorrectionPipeline
+from src.pipeline import GarmentCorrectionPipeline, extract_reference_detail_crop
+from src.verifier import PixelLockVerifier
+from src.vlm_heuristics import (
+    detect_micro_emblem_defect,
+    has_graphic_contrast,
+    segment_garment_bounds,
+    tighten_ref_box_to_salient,
+)
 from src.vlm_inspector import Qwen3VLInspector
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -93,13 +108,19 @@ class _HoldoutBridge(ComfyQwenBridge):
 def _build_holdout_specs() -> list[_HoldoutCaseSpec]:
     specs: list[_HoldoutCaseSpec] = []
 
-    # 1. Cream hoodie (4:5 portrait 400x500 model vs 512x512 cross-res reference)
+    # 1. Cream hoodie (4:5 portrait 400x500 model vs 512x512 cross-res reference + typography)
     m1 = np.full((500, 400, 3), (42, 48, 56), dtype=np.uint8)
-    m1[70:440, 80:320] = (232, 224, 210)
-    m1[140:190, 145:255] = (180, 50, 50)
+    m1_grad = np.linspace(224, 238, 370, dtype=np.uint8)[:, None, None]
+    m1[70:440, 80:320] = m1_grad - np.array([[[0, 8, 22]]], dtype=np.uint8)
+    cv2.putText(
+        m1, "KROVX", (142, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (180, 50, 50), 2, cv2.LINE_AA
+    )
     r1 = np.full((512, 512, 3), (42, 48, 56), dtype=np.uint8)
-    r1[72:450, 102:410] = (232, 224, 210)
-    r1[143:194, 184:328] = (32, 36, 44)
+    r1_grad = np.linspace(224, 238, 378, dtype=np.uint8)[:, None, None]
+    r1[72:450, 102:410] = r1_grad - np.array([[[0, 8, 22]]], dtype=np.uint8)
+    cv2.putText(
+        r1, "KOVA", (196, 182), cv2.FONT_HERSHEY_SIMPLEX, 0.92, (32, 36, 44), 2, cv2.LINE_AA
+    )
     specs.append(
         _HoldoutCaseSpec(
             case_id="01_cream_hoodie",
@@ -108,12 +129,12 @@ def _build_holdout_specs() -> list[_HoldoutCaseSpec]:
             vlm_dual_json=json.dumps(
                 {
                     "has_defect": True,
-                    "defect_summary": "Garbled chest wordmark",
+                    "defect_summary": "Garbled chest wordmark KROVX instead of KOVA",
                     "defects": [
                         {
                             "defect_summary": "Misspelled chest print",
-                            "model_bbox_2d": [360, 280, 640, 380],
-                            "ref_bbox_2d": [360, 280, 640, 380],
+                            "model_bbox_2d": [340, 275, 660, 390],
+                            "ref_bbox_2d": [340, 275, 660, 390],
                             "edit_prompt": (
                                 "Edit <image1>: Replace red chest print with dark wordmark "
                                 "matching <image2>."
@@ -336,14 +357,83 @@ def _build_holdout_specs() -> list[_HoldoutCaseSpec]:
         )
     )
 
+    # 9. Olive parka (1:1, 1024x1024): white lower-hem emblem over white studio backdrop
+    # Tests dynamic garment-relative 3x3 scan + border-connected backdrop segmentation.
+    m9 = np.full((1024, 1024, 3), 248, dtype=np.uint8)
+    m9[110:950, 190:830] = (42, 54, 44)
+    m9[730:768, 650:690] = (245, 245, 245)  # filled white hem patch
+    r9 = np.full((1024, 1024, 3), 248, dtype=np.uint8)
+    r9[110:950, 190:830] = (42, 54, 44)
+    r9[730:768, 662:678] = (245, 245, 245)
+    r9[742:768, 650:660] = (245, 245, 245)
+    r9[742:768, 680:690] = (245, 245, 245)
+    specs.append(
+        _HoldoutCaseSpec(
+            case_id="09_olive_parka_lower_hem",
+            model_rgb=m9,
+            ref_rgb=r9,
+            vlm_dual_json=json.dumps(
+                {"has_defect": False, "defect_summary": "Looks fine", "defects": []}
+            ),
+            vlm_solo_json=None,
+            expected_defect_count=1,
+            expected_bridge_calls=1,
+            expect_micro_roi=True,
+        )
+    )
+
+    # 10. Slate chino trousers (1:1, 512x512): single-defect pure ERASE on shaded plain cloth
+    m10 = np.full((512, 512, 3), (240, 240, 240), dtype=np.uint8)
+    shade10 = np.linspace(58, 72, 410, dtype=np.uint8)[:, None, None]
+    cloth10 = np.concatenate(
+        [
+            shade10,
+            np.clip(shade10.astype(np.int16) + 12, 0, 255).astype(np.uint8),
+            np.clip(shade10.astype(np.int16) + 26, 0, 255).astype(np.uint8),
+        ],
+        axis=2,
+    )
+    r10 = m10.copy()
+    m10[50:460, 120:390] = cloth10
+    r10[50:460, 120:390] = cloth10
+    m10[180:225, 210:260] = (230, 108, 38)  # unwanted orange remnant/tag
+    specs.append(
+        _HoldoutCaseSpec(
+            case_id="10_slate_chino_pure_erase",
+            model_rgb=m10,
+            ref_rgb=r10,
+            vlm_dual_json=json.dumps(
+                {
+                    "has_defect": True,
+                    "defect_summary": "Unwanted chromatic tag on front leg",
+                    "defects": [
+                        {
+                            "defect_summary": "Unwanted orange leg tag",
+                            "model_bbox_2d": [400, 340, 520, 450],
+                            "ref_bbox_2d": [400, 340, 520, 450],
+                            "edit_prompt": (
+                                "Edit <image1>: Remove and erase the unwanted orange tag "
+                                "completely, leaving clean seamless plain fabric matching <image2>."
+                            ),
+                        }
+                    ],
+                }
+            ),
+            vlm_solo_json=None,
+            expected_defect_count=1,
+            expected_bridge_calls=1,
+        )
+    )
+
     return specs
 
 
-def test_eight_holdout_garments_generalize_without_tuning(
+def test_ten_holdout_garments_generalize_without_tuning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("src.vlm_inspector.upload_png_bytes", lambda _url, name, _png: name)
     specs = _build_holdout_specs()
+    assert len(specs) == 10
     specs_by_id = {s.case_id: s for s in specs}
 
     tc_dir = tmp_path / "test_cases"
@@ -392,3 +482,90 @@ def test_eight_holdout_garments_generalize_without_tuning(
             assert artifact.localization.target_bbox.y2 >= int(0.43 * 600)
         if case_id == "08_forest_vest":
             assert artifact.localization.ref_detail_bbox.y1 <= int(0.22 * 512)
+        if case_id == "09_olive_parka_lower_hem":
+            assert artifact.localization.target_bbox.y1 >= int(0.60 * 1024)
+        if case_id == "10_slate_chino_pure_erase":
+            assert artifact.metrics.masked_reference_similarity >= 0.85
+
+
+def test_real_studio_assets_heuristics_masking_and_pixel_lock() -> None:
+    """Validate heuristics, AutoMasker, compositor & verifier on real repo studio photos."""
+    with Image.open(ROOT_DIR / "test_cases" / "kova_zip_jacket.png") as im:
+        kova_model = np.asarray(im.convert("RGB"), dtype=np.uint8)
+    with Image.open(ROOT_DIR / "test_cases" / "kova_zip_jacket_reference.png") as im:
+        kova_ref = np.asarray(im.convert("RGB"), dtype=np.uint8)
+    with Image.open(ROOT_DIR / "test_cases" / "sage_sweatpant.png") as im:
+        sage_model = np.asarray(im.convert("RGB"), dtype=np.uint8)
+    with Image.open(ROOT_DIR / "test_cases" / "sage_sweatpant_reference.png") as im:
+        sage_ref = np.asarray(im.convert("RGB"), dtype=np.uint8)
+    with Image.open(ROOT_DIR / "docs" / "assets" / "kova_zip_jacket_verification_report.png") as im:
+        report_rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+    kova_seg = segment_garment_bounds(kova_model, kova_ref)
+    sage_seg = segment_garment_bounds(sage_model, sage_ref)
+    assert kova_seg is not None and sage_seg is not None
+    kova_ref_b, kova_mod_b, _, _, _ = kova_seg
+    sage_ref_b, sage_mod_b, _, _, _ = sage_seg
+    assert (kova_mod_b[2] - kova_mod_b[0]) >= 0.20 and (kova_mod_b[3] - kova_mod_b[1]) >= 0.40
+    assert (sage_mod_b[2] - sage_mod_b[0]) >= 0.15 and (sage_mod_b[3] - sage_mod_b[1]) >= 0.35
+    assert (kova_ref_b[3] - kova_ref_b[1]) >= 0.40 and (sage_ref_b[3] - sage_ref_b[1]) >= 0.40
+
+    micro = detect_micro_emblem_defect(kova_model, kova_ref, "real_studio_check")
+    assert micro is not None
+    _, detected_m_box, detected_r_box, _ = micro
+    assert has_graphic_contrast(kova_ref, detected_r_box) is True
+    tight_r = tighten_ref_box_to_salient(kova_ref, detected_r_box)
+    assert tight_r.x_min >= kova_ref_b[0] and tight_r.x_max <= kova_ref_b[2]
+
+    manifest = CaseManifest(
+        case_id="kova_real_asset",
+        title="Real KOVA Studio Check",
+        garment_category="jacket",
+        target_detail="chest emblem",
+        prompt="Replace emblem",
+        model_image_filename="kova_zip_jacket.png",
+        reference_image_filename="kova_zip_jacket_reference.png",
+        model_target_box=detected_m_box,
+        reference_detail_box=tight_r,
+    )
+    loc = AutoMasker(MaskingConfig(strategy=MaskingStrategy.AUTO_VISION)).localize_and_mask(
+        kova_model, kova_ref, manifest
+    )
+    assert loc.binary_mask.shape == kova_model.shape[:2]
+    assert int(np.count_nonzero(loc.binary_mask)) > 500
+    assert float(np.max(loc.feathered_mask[loc.binary_mask == 0])) == 0.0
+
+    # Verify pixel-lock compositor & verifier against real 4-panel studio asset frames
+    orig_frame = report_rgb[40:1064, 0:1024]
+    repaired_frame = report_rgb[40:1064, 2060:3084]
+    changed_bool = (
+        np.max(np.abs(orig_frame.astype(np.int16) - repaired_frame.astype(np.int16)), axis=2) > 0
+    )
+    real_mask = changed_bool.astype(np.uint8)
+    real_feather = real_mask.astype(np.float32)
+
+    locked = PixelLockCompositor().composite(
+        original_image=orig_frame,
+        restored_roi=repaired_frame,
+        binary_mask=real_mask,
+        feathered_mask=real_feather,
+        context_bbox=PixelBBox(0, 0, 1024, 1024),
+    )
+    verifier = PixelLockVerifier(
+        replace(VerificationConfig(), strict_zero_outside_mask=True, min_masked_similarity=0.0)
+    )
+    ref_crop = extract_reference_detail_crop(kova_ref, tight_r.to_pixel_bbox(1024, 1024))
+    metrics = verifier.verify(
+        "kova_real_asset",
+        orig_frame,
+        locked,
+        real_mask,
+        backend_used="real_studio_asset",
+        detection_method="vlm_heuristics",
+        reference_crop=ref_crop,
+    )
+    assert metrics.passed is True
+    assert metrics.unmasked_max_abs_diff == 0
+    assert metrics.unmasked_changed_pixels_count == 0
+    assert metrics.unmasked_ssim == 1.0
+    assert metrics.masked_changed_pixels_count > 10000

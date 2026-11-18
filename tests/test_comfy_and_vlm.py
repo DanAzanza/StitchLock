@@ -14,6 +14,7 @@ from setup_test_cases import setup_all_test_cases
 from src.comfy_client import ComfyQwenBridge
 from src.comfy_launcher import (
     ComfyInstance,
+    ComfyServerManager,
     build_headless_command,
     detect_comfy_desktop_instance,
     detect_standalone_instance,
@@ -514,3 +515,110 @@ def test_comfy_launcher_detection_and_fail_fast(
     assert standalone is not None
     assert standalone.python_exe == py_file
     assert standalone.main_py == comfy_dir / "main.py"
+
+
+def test_comfy_server_manager_isolated_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _FakeProcess:
+        def __init__(self, pid: int, returncode: int | None = None) -> None:
+            self.pid = pid
+            self.returncode = returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            _ = timeout
+            return 0 if self.returncode is None else self.returncode
+
+    cfg = ComfyConfig(server_url="http://127.0.0.1:8123", fallback_ports=(), auto_launch=True)
+    fake_inst = ComfyInstance(
+        name="Isolated Headless",
+        mode="headless",
+        python_exe=tmp_path / "python.exe",
+        main_py=tmp_path / "main.py",
+        working_dir=tmp_path,
+    )
+
+    mgr_a = ComfyServerManager(register_atexit=False)
+    mgr_b = ComfyServerManager(register_atexit=False)
+
+    online_calls = {"n": 0}
+    spawned: list[_FakeProcess] = []
+    freed_urls: list[str] = []
+    terminated_pids: list[int] = []
+
+    def _fake_online(url: str, timeout: float = 1.5) -> bool:
+        _ = (url, timeout)
+        online_calls["n"] += 1
+        return online_calls["n"] >= 2
+
+    def _fake_spawn(inst: ComfyInstance, host: str, port: str) -> _FakeProcess:
+        _ = (inst, host, port)
+        proc = _FakeProcess(pid=4242 + len(spawned), returncode=None)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr("src.comfy_launcher.probe_candidate_servers", lambda _c: None)
+    monkeypatch.setattr("src.comfy_launcher.detect_comfyui", lambda: fake_inst)
+    monkeypatch.setattr("src.comfy_launcher._spawn_instance", _fake_spawn)
+    monkeypatch.setattr("src.comfy_launcher.is_comfy_server_online", _fake_online)
+    monkeypatch.setattr("src.comfy_launcher.time.sleep", lambda _s: None)
+    monkeypatch.setattr("src.comfy_launcher._free_server_vram", freed_urls.append)
+    monkeypatch.setattr(
+        "src.comfy_launcher._terminate_process_tree", lambda p: terminated_pids.append(p.pid)
+    )
+
+    url = mgr_a.ensure_server(cfg, startup_timeout=5.0)
+    assert url == "http://127.0.0.1:8123"
+    assert len(spawned) == 1
+    assert mgr_a.process is spawned[0]
+    assert mgr_a.server_url == "http://127.0.0.1:8123"
+    assert mgr_b.process is None
+    assert mgr_b.server_url is None
+
+    # URL switch stops prior spawned process cleanly before spawning replacement
+    online_calls["n"] = 0
+    cfg_alt = ComfyConfig(server_url="http://127.0.0.1:8199", fallback_ports=(), auto_launch=True)
+    alt_url = mgr_a.ensure_server(cfg_alt, startup_timeout=5.0)
+    assert alt_url == "http://127.0.0.1:8199"
+    assert len(spawned) == 2
+    assert freed_urls == ["http://127.0.0.1:8123"]
+    assert terminated_pids == [4242]
+    assert mgr_a.process is spawned[1]
+    assert mgr_a.server_url == "http://127.0.0.1:8199"
+
+    mgr_a.stop()
+    assert freed_urls == ["http://127.0.0.1:8123", "http://127.0.0.1:8199"]
+    assert terminated_pids == [4242, 4243]
+    assert mgr_a.process is None
+    assert mgr_a.server_url is None
+
+    # Idempotent second stop
+    mgr_a.stop()
+    assert freed_urls == ["http://127.0.0.1:8123", "http://127.0.0.1:8199"]
+    assert terminated_pids == [4242, 4243]
+
+    # Premature exit clears manager state and raises ComfyExecutionError
+    crashed = _FakeProcess(pid=5001, returncode=1)
+    monkeypatch.setattr("src.comfy_launcher._spawn_instance", lambda *_a: crashed)
+    monkeypatch.setattr("src.comfy_launcher.is_comfy_server_online", lambda *_a, **_kw: False)
+    with pytest.raises(ComfyExecutionError, match="exited prematurely"):
+        mgr_b.ensure_server(cfg, startup_timeout=2.0)
+    assert mgr_b.process is None
+    assert mgr_b.server_url is None
+
+    # Startup timeout terminates live hung process and clears manager state
+    hung = _FakeProcess(pid=5002, returncode=None)
+    ticks = iter([0.0, 0.0, 10.0])
+    monkeypatch.setattr("src.comfy_launcher._spawn_instance", lambda *_a: hung)
+    monkeypatch.setattr("src.comfy_launcher.time.monotonic", lambda: next(ticks, 10.0))
+    with pytest.raises(ComfyExecutionError, match="did not respond"):
+        mgr_b.ensure_server(cfg, startup_timeout=2.0)
+    assert terminated_pids == [4242, 4243, 5002]
+    assert mgr_b.process is None
+    assert mgr_b.server_url is None
