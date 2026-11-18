@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -159,11 +159,26 @@ class ComfyConfig:
 
 
 @dataclass(frozen=True)
+class HeuristicConfig:
+    """Configuration thresholds for CV box refinement and defect heuristics."""
+
+    min_graphic_contrast_std: float = 14.0
+    bg_color_distance_threshold: float = 28.0
+    cloth_color_distance_threshold: float = 44.0
+    chroma_distance_threshold: float = 15.0
+    connected_component_salience_threshold: float = 45.0
+    emblem_correlation_threshold: float = 0.75
+    shift_y_threshold: float = 0.25
+    shift_x_threshold: float = 0.22
+
+
+@dataclass(frozen=True)
 class VerificationConfig:
     """Configuration parameters for automated pixel-lock verification."""
 
     diff_amplification_factor: float = 4.0
     strict_zero_outside_mask: bool = True
+    min_masked_similarity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -176,6 +191,15 @@ class PipelineConfig:
     masking: MaskingConfig
     comfyui: ComfyConfig
     verification: VerificationConfig
+    inspector_workflow_path: Path | None = None
+    heuristics: HeuristicConfig = field(default_factory=HeuristicConfig)
+
+    @property
+    def resolved_inspector_workflow_path(self) -> Path:
+        """Return configured inspector workflow path or default next to edit workflow."""
+        if self.inspector_workflow_path is not None:
+            return self.inspector_workflow_path
+        return self.workflow_path.parent / "qwen3_vl_inspector_api.json"
 
 
 @dataclass(frozen=True)
@@ -213,6 +237,7 @@ class VerificationMetrics:
     masked_pixels: int
     backend_used: str
     detection_method: str
+    masked_reference_similarity: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize metrics to a JSON-compatible dictionary."""
@@ -232,6 +257,7 @@ class VerificationMetrics:
             "masked_pixels": self.masked_pixels,
             "backend_used": self.backend_used,
             "detection_method": self.detection_method,
+            "masked_reference_similarity": round(self.masked_reference_similarity, 4),
         }
 
 
@@ -259,6 +285,7 @@ def load_pipeline_config(config_path: Path, base_dir: Path | None = None) -> Pip
     mask_raw = raw.get("masking", {})
     comfy_raw = raw.get("comfyui", {})
     ver_raw = raw.get("verification", {})
+    heur_raw = raw.get("heuristics", {})
 
     strategy = MaskingStrategy(mask_raw.get("strategy", MaskingStrategy.AUTO_VISION.value))
 
@@ -271,12 +298,23 @@ def load_pipeline_config(config_path: Path, base_dir: Path | None = None) -> Pip
     if not (0.0 < feather_ratio <= 0.1):
         raise ConfigurationError(f"feather_sigma_ratio must be in (0.0, 0.1], got {feather_ratio}.")
 
+    min_masked_sim = float(ver_raw.get("min_masked_similarity", 0.0))
+    if not (0.0 <= min_masked_sim <= 1.0):
+        raise ConfigurationError(
+            f"min_masked_similarity must be in [0.0, 1.0], got {min_masked_sim}."
+        )
+
+    inspector_wf_raw = pipe_raw.get(
+        "inspector_workflow_path", "workflows/qwen3_vl_inspector_api.json"
+    )
+
     return PipelineConfig(
         test_cases_dir=resolve_safe_path(root, pipe_raw.get("test_cases_dir", "test_cases")),
         outputs_dir=resolve_safe_path(root, pipe_raw.get("outputs_dir", "outputs")),
         workflow_path=resolve_safe_path(
             root, pipe_raw.get("workflow_path", "workflows/qwen_2_1_edit_api.json")
         ),
+        inspector_workflow_path=resolve_safe_path(root, inspector_wf_raw),
         masking=MaskingConfig(
             strategy=strategy,
             mask_dilation_ratio=dilation_ratio,
@@ -295,5 +333,20 @@ def load_pipeline_config(config_path: Path, base_dir: Path | None = None) -> Pip
         verification=VerificationConfig(
             diff_amplification_factor=float(ver_raw.get("diff_amplification_factor", 4.0)),
             strict_zero_outside_mask=bool(ver_raw.get("strict_zero_outside_mask", True)),
+            min_masked_similarity=min_masked_sim,
+        ),
+        heuristics=HeuristicConfig(
+            min_graphic_contrast_std=float(heur_raw.get("min_graphic_contrast_std", 14.0)),
+            bg_color_distance_threshold=float(heur_raw.get("bg_color_distance_threshold", 28.0)),
+            cloth_color_distance_threshold=float(
+                heur_raw.get("cloth_color_distance_threshold", 44.0)
+            ),
+            chroma_distance_threshold=float(heur_raw.get("chroma_distance_threshold", 15.0)),
+            connected_component_salience_threshold=float(
+                heur_raw.get("connected_component_salience_threshold", 45.0)
+            ),
+            emblem_correlation_threshold=float(heur_raw.get("emblem_correlation_threshold", 0.75)),
+            shift_y_threshold=float(heur_raw.get("shift_y_threshold", 0.25)),
+            shift_x_threshold=float(heur_raw.get("shift_x_threshold", 0.22)),
         ),
     )
