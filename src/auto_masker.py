@@ -251,9 +251,14 @@ class AutoMasker:
         micro_dilation_px = max(
             2, int(round(ref_dim * min(self._config.mask_dilation_ratio, 0.008)))
         )
+        prompt_lower = manifest.prompt.lower()
+        is_erase_pass = any(tok in prompt_lower for tok in ("remove", "erase", "delete")) and not (
+            any(tok in prompt_lower for tok in ("replace", "add ", "insert"))
+        )
         is_micro_target = (
-            min(height, width) >= 512
-            and max(target_bbox.width / float(width), target_bbox.height / float(height)) <= 0.056
+            not is_erase_pass
+            and min(height, width) >= 512
+            and max(target_bbox.width / float(width), target_bbox.height / float(height)) <= 0.080
             and (target_bbox.width + 2 * micro_dilation_px) <= crop_side
             and (target_bbox.height + 2 * micro_dilation_px) <= crop_side
         )

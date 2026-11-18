@@ -1312,14 +1312,21 @@ def test_connected_box_misplaced_split_and_micro_emblem_supersampling(tmp_path: 
         is None
     )
 
-    # 4d. AutoMasker micro-ROI boundary transitions: macro, <512px, elongated 512x4096, corners
+    # 4d. AutoMasker micro-ROI boundary transitions: macro, erase pass, <512px, elongated, corners
     macro_manifest = replace(
         manifest,
-        model_target_box=NormalizedBox(0.50, 0.30, 0.56, 0.36),
-        reference_detail_box=NormalizedBox(0.50, 0.30, 0.56, 0.36),
+        model_target_box=NormalizedBox(0.50, 0.30, 0.59, 0.39),
+        reference_detail_box=NormalizedBox(0.50, 0.30, 0.59, 0.39),
     )
     assert masker.localize_and_mask(
         large_model, large_ref, macro_manifest
+    ).context_bbox == PixelBBox(0, 0, 1024, 1024)
+    erase_micro_manifest = replace(
+        micro_manifest,
+        prompt="Edit <image1>: Remove and erase misplaced badge from <image2>.",
+    )
+    assert masker.localize_and_mask(
+        large_model, large_ref, erase_micro_manifest
     ).context_bbox == PixelBBox(0, 0, 1024, 1024)
     sub512_model = np.full((511, 511, 3), 40, dtype=np.uint8)
     assert masker.localize_and_mask(sub512_model, large_ref, micro_manifest).context_bbox == (
@@ -1344,3 +1351,35 @@ def test_connected_box_misplaced_split_and_micro_emblem_supersampling(tmp_path: 
     assert np.count_nonzero(corner_loc.cropped_mask_greyscale) == np.count_nonzero(
         corner_loc.binary_mask
     )
+
+    # 4e. Left-chest micro-emblem generalization & horizontal-shift splitting
+    left_clean = np.full((512, 512, 3), 248, dtype=np.uint8)
+    left_clean[60:480, 100:410] = np.array([36, 46, 52], dtype=np.uint8)
+    left_clean[178:192, 198:204] = crest_rgb
+    left_clean[182:192, 191:196] = crest_rgb
+    left_clean[182:192, 206:211] = crest_rgb
+    left_broken = left_clean.copy()
+    left_broken[178:192, 191:211] = crest_rgb
+    left_res = Qwen3VLInspector.parse_vlm_json_response(no_defect_json, left_broken, left_clean)
+    assert left_res.has_defect is True
+    assert 0.35 <= left_res.model_target_box.x_min < left_res.model_target_box.x_max <= 0.46
+
+    horiz_ref = np.full((256, 256, 3), 242, dtype=np.uint8)
+    horiz_ref[14:242, 74:182] = np.array([130, 140, 115], dtype=np.uint8)
+    horiz_ref[72:88, 82:96] = np.array([195, 95, 55], dtype=np.uint8)  # left hip in ref
+    horiz_model = np.full((256, 256, 3), 242, dtype=np.uint8)
+    horiz_model[14:242, 74:182] = np.array([130, 140, 115], dtype=np.uint8)
+    horiz_model[72:96, 152:174] = np.array([195, 95, 55], dtype=np.uint8)  # misplaced right hip
+    horiz_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Logo on wrong side",
+            "model_bbox_2d": [580, 275, 690, 385],
+            "ref_bbox_2d": [300, 260, 390, 360],
+            "edit_prompt": "Edit <image1>: Replace wrong-side patch with <image2>.",
+        }
+    )
+    horiz_res = Qwen3VLInspector.parse_vlm_json_response(horiz_json, horiz_model, horiz_ref)
+    assert len(horiz_res.resolved_defects) == 2
+    assert horiz_res.resolved_defects[0].model_target_box.x_min >= 0.55
+    assert horiz_res.resolved_defects[1].model_target_box.x_max <= 0.45

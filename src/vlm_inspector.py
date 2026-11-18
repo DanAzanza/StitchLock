@@ -840,11 +840,19 @@ class Qwen3VLInspector:
         true_rx1, true_ry1, true_rx2, true_ry2 = cls._find_salient_ref_bounds(
             ref_rgb, r_box, rbg, ref_cloth
         )
+        m_cx_raw = 0.5 * (m_box.x_min + m_box.x_max)
+        r_cx = 0.5 * (true_rx1 + true_rx2)
+        rel_rx = (r_cx - rx1) / max(0.1, rx2 - rx1)
+        expected_mcx = mx1 + rel_rx * (mx2 - mx1)
+
         m_cy = 0.5 * (m_box.y_min + m_box.y_max)
         r_cy = 0.5 * (true_ry1 + true_ry2)
         rel_ry = (r_cy - ry1) / max(0.1, ry2 - ry1)
         expected_mcy = my1 + rel_ry * (my2 - my1)
-        if abs(m_cy - r_cy) <= 0.25 or abs(m_cy - expected_mcy) <= 0.04:
+
+        y_shifted = abs(m_cy - r_cy) > 0.25 and abs(m_cy - expected_mcy) > 0.04
+        x_shifted = abs(m_cx_raw - r_cx) > 0.22 and abs(m_cx_raw - expected_mcx) > 0.12
+        if not y_shifted and not x_shifted:
             return defects
 
         h, w = model_rgb.shape[:2]
@@ -881,30 +889,41 @@ class Qwen3VLInspector:
             ),
         )
 
-        ins_w = max(0.058, (true_rx2 - true_rx1) * (mx2 - mx1) / max(0.1, rx2 - rx1) + 0.022)
-        ins_h = max(0.062, (true_ry2 - true_ry1) * (my2 - my1) / max(0.1, ry2 - ry1) + 0.022)
-        if m_cy > expected_mcy:
-            max_cy = max(my1 + 0.14 * (my2 - my1), erase_box.y_min - 0.5 * ins_h - 0.014)
-            target_cy = min(expected_mcy - 0.015, max_cy)
+        ins_w = min(
+            0.074, max(0.060, (true_rx2 - true_rx1) * (mx2 - mx1) / max(0.1, rx2 - rx1) + 0.026)
+        )
+        ins_h = min(
+            0.076, max(0.068, (true_ry2 - true_ry1) * (my2 - my1) / max(0.1, ry2 - ry1) + 0.030)
+        )
+        if not y_shifted:
+            target_cy = max(my1 + 0.10 * (my2 - my1), min(my2 - 0.10 * (my2 - my1), expected_mcy))
+        elif m_cy > expected_mcy:
+            min_allowed_cy = my1 + 0.15 * (my2 - my1)
+            clear_above_cy = max(min_allowed_cy, erase_box.y_min - 0.5 * ins_h - 0.004)
+            target_cy = min(expected_mcy, clear_above_cy)
         else:
-            min_cy = min(my2 - 0.14 * (my2 - my1), erase_box.y_max + 0.5 * ins_h + 0.014)
-            target_cy = max(expected_mcy + 0.015, min_cy)
+            max_allowed_cy = my2 - 0.15 * (my2 - my1)
+            clear_below_cy = min(max_allowed_cy, erase_box.y_max + 0.5 * ins_h + 0.004)
+            target_cy = max(expected_mcy, clear_below_cy)
 
         iy1 = max(0.0, min(1.0 - ins_h, target_cy - 0.5 * ins_h))
         iy2 = min(1.0, iy1 + ins_h)
-        m_cx = 0.5 * (erase_box.x_min + erase_box.x_max)
-        ix1 = max(m_box.x_min + 0.025, m_cx - 0.5 * ins_w)
-        y_band = mm[int(iy1 * h) : max(int(iy1 * h) + 1, int(iy2 * h)), :]
-        cloth_cols = np.where(y_band.mean(axis=0) > 0.5)[0]
-        half_mid = 0.5 * (mx1 + mx2) * w
-        side_cols = (
-            cloth_cols[cloth_cols < half_mid]
-            if m_cx * w < half_mid
-            else cloth_cols[cloth_cols >= half_mid]
-        )
-        if side_cols.size >= 10:
-            edge_x = int(side_cols[0]) / float(w)
-            ix1 = max(ix1, min(int(side_cols[-1]) / float(w) - ins_w, edge_x - 0.025))
+        if x_shifted:
+            ix1 = max(mx1 + 0.02, min(mx2 - ins_w - 0.02, expected_mcx - 0.5 * ins_w))
+        else:
+            m_cx = 0.5 * (erase_box.x_min + erase_box.x_max)
+            ix1 = max(m_box.x_min + 0.025, m_cx - 0.5 * ins_w)
+            y_band = mm[int(iy1 * h) : max(int(iy1 * h) + 1, int(iy2 * h)), :]
+            cloth_cols = np.where(y_band.mean(axis=0) > 0.5)[0]
+            half_mid = 0.5 * (mx1 + mx2) * w
+            side_cols = (
+                cloth_cols[cloth_cols < half_mid]
+                if m_cx * w < half_mid
+                else cloth_cols[cloth_cols >= half_mid]
+            )
+            if side_cols.size >= 10:
+                edge_x = int(side_cols[0]) / float(w)
+                ix1 = max(ix1, min(int(side_cols[-1]) / float(w) - ins_w, edge_x - 0.025))
         ix1 = max(0.0, min(1.0 - ins_w, ix1))
         ix2 = min(1.0, ix1 + ins_w)
 
@@ -1027,15 +1046,28 @@ class Qwen3VLInspector:
         ref_rgb: NDArray[np.uint8],
         source_label: str,
     ) -> VLMInspectionResult | None:
-        """Fallback localizer catching small chest-logo mismatches missed at 1024px ViT scale."""
-        chest_hint = NormalizedBox(0.50, 0.26, 0.68, 0.46)
-        m_emblem = cls._find_salient_emblem_box(model_rgb, chest_hint)
-        r_emblem = cls._find_salient_emblem_box(ref_rgb, chest_hint)
-        if m_emblem is None or r_emblem is None:
+        """Fallback localizer catching small emblem mismatches across general garment zones."""
+        candidate_zones = (
+            NormalizedBox(0.50, 0.26, 0.68, 0.46),  # right chest (viewer perspective)
+            NormalizedBox(0.32, 0.26, 0.50, 0.46),  # left chest (viewer perspective)
+            NormalizedBox(0.41, 0.22, 0.59, 0.44),  # center chest / upper back
+            NormalizedBox(0.28, 0.22, 0.48, 0.44),  # upper left hip / thigh
+            NormalizedBox(0.52, 0.22, 0.72, 0.44),  # upper right hip / thigh
+        )
+        best_match: tuple[float, NormalizedBox, NormalizedBox] | None = None
+        for zone in candidate_zones:
+            m_emblem = cls._find_salient_emblem_box(model_rgb, zone)
+            r_emblem = cls._find_salient_emblem_box(ref_rgb, zone)
+            if m_emblem is None or r_emblem is None:
+                continue
+            corr = cls._emblem_pattern_correlation(model_rgb, m_emblem, ref_rgb, r_emblem)
+            if corr < 0.75:
+                best_match = (corr, m_emblem, r_emblem)
+                break
+
+        if best_match is None:
             return None
-        corr = cls._emblem_pattern_correlation(model_rgb, m_emblem, ref_rgb, r_emblem)
-        if corr >= 0.75:
-            return None
+        corr, m_emblem, r_emblem = best_match
 
         m_w = m_emblem.x_max - m_emblem.x_min
         m_h = m_emblem.y_max - m_emblem.y_min
