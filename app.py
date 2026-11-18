@@ -22,19 +22,25 @@ import numpy as np
 from numpy.typing import NDArray
 from src.comfy_launcher import ensure_comfyui_server, stop_auto_started_server
 from src.models import ComfyExecutionError, MaskingStrategy, PipelineError, load_pipeline_config
-from src.ui_handlers import (
+from src.ui_custom_handlers import (
     CONFIG_PATH,
     ROOT_DIR,
     UI_CSS_PATH,
     VIEW_COMPARE,
     VIEW_HEATMAP,
-    BrowserSessionLifecycle,
     ImageInput,
+    detect_custom_ui,
+    ensure_environment_ready,
+    preview_custom_boxes_ui,
+    render_box_overlay,
+    render_multi_box_overlay,
+    run_custom_upload_ui,
+)
+from src.ui_handlers import (
+    BrowserSessionLifecycle,
     add_pair_to_inbox,
     build_add_look_tile,
     build_artist_heatmap,
-    detect_custom_ui,
-    ensure_environment_ready,
     execute_batch_ui,
     format_look_bar,
     gallery_with_add_tile,
@@ -42,10 +48,6 @@ from src.ui_handlers import (
     inspect_single_case_ui,
     is_case_repaired,
     load_single_case_view_ui,
-    preview_custom_boxes_ui,
-    render_box_overlay,
-    render_multi_box_overlay,
-    run_custom_upload_ui,
     slider_pair,
 )
 
@@ -354,7 +356,7 @@ def build_gradio_app(lifecycle: BrowserSessionLifecycle | None = None) -> Any:
         import gradio as gr
     except ImportError as exc:
         raise RuntimeError(
-            "Gradio is required to launch the web UI. Install via: pip install gradio>=5.0.0"
+            "Gradio is required to launch the web UI. Install via: pip install gradio>=6.0.0"
         ) from exc
 
     def _ui_guard(fn: Callable[P, R]) -> Callable[P, R]:

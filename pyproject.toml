@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ui = ["gradio>=5.0.0"]
+ui = ["gradio>=6.0.0"]
 dev = ["pytest>=8.0.0", "ruff>=0.4.0", "pyright>=1.1.350"]
 
 [tool.setuptools.packages.find]
