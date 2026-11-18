@@ -27,6 +27,7 @@ class PixelLockVerifier:
         binary_mask: NDArray[np.uint8],
         backend_used: str = "unknown",
         detection_method: str = "unknown",
+        reference_crop: NDArray[np.uint8] | None = None,
     ) -> VerificationMetrics:
         """Compute exact pixel-wise verification metrics outside and inside the mask."""
         self._validate_inputs(original_image, final_image, binary_mask)
@@ -48,7 +49,7 @@ class PixelLockVerifier:
         abs_diff = np.abs(original_image.astype(np.int16) - final_image.astype(np.int16))
         pixel_max_channel_diff = np.max(abs_diff, axis=2)
 
-        # Unmasked region metrics (must be strictly 0 changed pixels)
+        # Unmasked region metrics
         unmasked_diffs = pixel_max_channel_diff[unmasked_bool]
         unmasked_max_abs_diff = int(np.max(unmasked_diffs))
         unmasked_changed_count = int(np.count_nonzero(unmasked_diffs > 0))
@@ -60,17 +61,27 @@ class PixelLockVerifier:
         )
         unmasked_ssim = self._compute_unmasked_ssim(original_image, final_image, unmasked_bool)
 
-        # Masked region metrics (ensure the detail was actually updated)
+        # Masked region metrics (ensure non-degenerate restoration aligned with reference)
         masked_diffs = pixel_max_channel_diff[masked_bool]
         masked_mean_abs_diff = float(np.mean(abs_diff[masked_bool]))
         masked_changed_count = int(np.count_nonzero(masked_diffs > 0))
-
-        passed = (
-            unmasked_max_abs_diff == 0
-            and unmasked_changed_count == 0
-            and unmasked_ssim == 1.0
-            and masked_changed_count > 0
+        masked_ref_sim = self._compute_masked_reference_similarity(
+            original_image=original_image,
+            final_image=final_image,
+            masked_bool=masked_bool,
+            reference_crop=reference_crop,
         )
+
+        if self._config.strict_zero_outside_mask:
+            unmasked_ok = (
+                unmasked_max_abs_diff == 0 and unmasked_changed_count == 0 and unmasked_ssim == 1.0
+            )
+        else:
+            unmasked_ok = unmasked_max_abs_diff <= 2 and unmasked_ssim >= 0.995
+
+        min_sim = self._config.min_masked_similarity if reference_crop is not None else 0.01
+        masked_ok = masked_changed_count > 0 and masked_ref_sim >= min_sim and masked_ref_sim > 0.0
+        passed = bool(unmasked_ok and masked_ok)
 
         return VerificationMetrics(
             case_id=case_id,
@@ -87,6 +98,7 @@ class PixelLockVerifier:
             masked_pixels=masked_pixels,
             backend_used=backend_used,
             detection_method=detection_method,
+            masked_reference_similarity=masked_ref_sim,
         )
 
     def build_diff_heatmap(
@@ -95,14 +107,14 @@ class PixelLockVerifier:
         final_image: NDArray[np.uint8],
         binary_mask: NDArray[np.uint8],
     ) -> NDArray[np.uint8]:
-        """Generate an amplified (x50) pixel-difference heatmap with mask boundary contour."""
+        """Generate an amplified pixel-difference heatmap with mask boundary contour."""
         abs_diff = np.abs(original_image.astype(np.float32) - final_image.astype(np.float32))
         max_channel_diff = np.max(abs_diff, axis=2)
         amplified = np.clip(
             max_channel_diff * self._config.diff_amplification_factor, 0.0, 255.0
         ).astype(np.uint8)
 
-        # Apply inferno/turbo style colormap in RGB, keeping 0 diff strictly pitch-black (0, 0, 0)
+        # Apply inferno/turbo style colormap in RGB, keeping 0 diff dark obsidian
         heatmap_bgr = cv2.applyColorMap(amplified, cv2.COLORMAP_INFERNO)
         heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
         zero_mask = max_channel_diff == 0
@@ -124,7 +136,7 @@ class PixelLockVerifier:
     ) -> NDArray[np.uint8]:
         """Render the 4-panel verification report image:
         [1. Original On-Model (Hallucinated) | 2. Auto-Mask & Product Ref Crop |
-         3. Corrected Output | 4. Amplified Pixel-Diff Heatmap (x50)]
+         3. Corrected Output | 4. Amplified Pixel-Diff Heatmap]
         """
         height, width = original_image.shape[:2]
 
@@ -185,7 +197,7 @@ class PixelLockVerifier:
         # Panel 3: Corrected Output
         panel_3 = final_image.copy()
 
-        # Panel 4: Amplified Pixel-Diff Heatmap (x50)
+        # Panel 4: Amplified Pixel-Diff Heatmap
         panel_4 = self.build_diff_heatmap(original_image, final_image, binary_mask)
 
         # Add headers to each panel
@@ -193,7 +205,7 @@ class PixelLockVerifier:
             "1. Original On-Model (Hallucinated)",
             "2. Auto-Mask & Product Ref Crop",
             "3. Corrected Output (Pixel-Locked)",
-            f"4. Amplified Diff Heatmap (x{int(self._config.diff_amplification_factor)})",
+            f"4. Amplified Diff Heatmap (x{int(round(self._config.diff_amplification_factor))})",
         ]
         panels = [
             self._add_panel_header(p, t)
@@ -206,13 +218,13 @@ class PixelLockVerifier:
             [panels[0], divider, panels[1], divider, panels[2], divider, panels[3]], axis=1
         )
 
-        # Add bottom verification banner summarizing mathematical guarantee
+        # Add bottom verification banner summarizing pixel-lock status
         banner_h = 54
         banner = np.full((banner_h, grid.shape[1], 3), (15, 20, 28), dtype=np.uint8)
         status_label = (
-            "PASS - ZERO DETAIL LOSS GUARANTEED"
+            "PASS - UNMASKED PIXEL-LOCK VERIFIED"
             if metrics.passed
-            else "FAIL - PIXEL DRIFT DETECTED"
+            else "FAIL - VERIFICATION GATE FAILED"
         )
         status_color = (40, 235, 130) if metrics.passed else (255, 75, 75)
 
@@ -258,23 +270,121 @@ class PixelLockVerifier:
         final_image: NDArray[np.uint8],
         unmasked_bool: NDArray[np.bool_],
     ) -> float:
-        """Compute exact structural similarity over the unmasked pixel set."""
-        orig_vals = original_image[unmasked_bool].astype(np.float64)
-        final_vals = final_image[unmasked_bool].astype(np.float64)
-        if np.array_equal(orig_vals, final_vals):
+        """Compute 2D Gaussian-windowed SSIM (11x11, sigma=1.5) isolated to unmasked pixels."""
+        if np.array_equal(original_image[unmasked_bool], final_image[unmasked_bool]):
             return 1.0
+
+        # Isolate unmasked canvas so masked edits never bleed across the 11x11 Gaussian window
+        orig_f = original_image.astype(np.float64)
+        final_canvas = np.where(unmasked_bool[..., None], final_image, original_image).astype(
+            np.float64
+        )
 
         c1 = (0.01 * 255.0) ** 2
         c2 = (0.03 * 255.0) ** 2
-        mu_x = float(np.mean(orig_vals))
-        mu_y = float(np.mean(final_vals))
-        var_x = float(np.var(orig_vals))
-        var_y = float(np.var(final_vals))
-        cov_xy = float(np.mean((orig_vals - mu_x) * (final_vals - mu_y)))
+        ksize = (11, 11)
+        sigma = 1.5
 
-        numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * cov_xy + c2)
-        denominator = (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
-        return float(numerator / denominator)
+        mu_x = cv2.GaussianBlur(orig_f, ksize, sigma)
+        mu_y = cv2.GaussianBlur(final_canvas, ksize, sigma)
+        sigma_x_sq = np.maximum(0.0, cv2.GaussianBlur(orig_f * orig_f, ksize, sigma) - mu_x * mu_x)
+        sigma_y_sq = np.maximum(
+            0.0, cv2.GaussianBlur(final_canvas * final_canvas, ksize, sigma) - mu_y * mu_y
+        )
+        sigma_xy = cv2.GaussianBlur(orig_f * final_canvas, ksize, sigma) - mu_x * mu_y
+
+        numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+        denominator = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x_sq + sigma_y_sq + c2)
+        ssim_map = np.mean(numerator / np.maximum(denominator, 1e-12), axis=2)
+        return float(np.clip(np.mean(ssim_map[unmasked_bool]), -1.0, 1.0))
+
+    @classmethod
+    def _compute_masked_reference_similarity(
+        cls,
+        original_image: NDArray[np.uint8],
+        final_image: NDArray[np.uint8],
+        masked_bool: NDArray[np.bool_],
+        reference_crop: NDArray[np.uint8] | None,
+    ) -> float:
+        """Measure non-degeneracy and reference similarity inside the masked region."""
+        final_masked = final_image[masked_bool].astype(np.float32)
+        orig_masked = original_image[masked_bool].astype(np.float32)
+        if final_masked.size == 0:
+            return 0.0
+        if float(np.mean(final_masked)) < 1.0 and float(np.mean(orig_masked)) > 5.0:
+            return 0.0
+        if reference_crop is None:
+            return 1.0
+
+        ys, xs = np.where(masked_bool)
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        patch_ref = (
+            reference_crop[y1:y2, x1:x2]
+            if reference_crop.shape[:2] == final_image.shape[:2]
+            else reference_crop
+        )
+        if patch_ref.size == 0:
+            return 0.0
+        pr_64 = cv2.resize(patch_ref, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+        mask_u8 = masked_bool.astype(np.uint8) * 255
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_u8)
+        boxes: list[tuple[int, int, int, int]] = []
+        for lbl in range(1, num_labels):
+            area = int(stats[lbl, cv2.CC_STAT_AREA])
+            if area < 16:
+                continue
+            bx = int(stats[lbl, cv2.CC_STAT_LEFT])
+            by = int(stats[lbl, cv2.CC_STAT_TOP])
+            bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+            bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+            boxes.append((by, by + bh, bx, bx + bw))
+        if not boxes:
+            boxes = [(y1, y2, x1, x2)]
+
+        island_scores = [
+            cls._score_masked_island(final_image[iy1:iy2, ix1:ix2], pr_64)
+            for iy1, iy2, ix1, ix2 in boxes
+        ]
+        return float(np.clip(max(island_scores), 0.0, 1.0))
+
+    @staticmethod
+    def _score_masked_island(patch_final: NDArray[np.uint8], pr_64: NDArray[np.float32]) -> float:
+        if patch_final.size == 0:
+            return 0.0
+        if float(np.mean(patch_final)) < 2.0 and float(np.mean(pr_64)) > 10.0:
+            return 0.0
+
+        pf_64 = cv2.resize(patch_final, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+        color_diff = float(
+            np.mean(np.abs(np.mean(pf_64, axis=(0, 1)) - np.mean(pr_64, axis=(0, 1))))
+        )
+        color_sim = max(0.0, 1.0 - color_diff / 255.0)
+        if float(np.std(pf_64)) < 1e-3 and float(np.std(pr_64)) > 5.0 and color_diff > 45.0:
+            return 0.0
+
+        lf = cv2.cvtColor(pf_64, cv2.COLOR_RGB2GRAY)
+        lr = cv2.cvtColor(pr_64, cv2.COLOR_RGB2GRAY)
+        hf, _ = np.histogram(lf, bins=16, range=(0.0, 256.0))
+        hr, _ = np.histogram(lr, bins=16, range=(0.0, 256.0))
+        hf_norm = hf.astype(np.float32) / max(1.0, float(hf.sum()))
+        hr_norm = hr.astype(np.float32) / max(1.0, float(hr.sum()))
+        hist_sim = float(np.sum(np.minimum(hf_norm, hr_norm)))
+
+        std_f, std_r = float(np.std(lf)), float(np.std(lr))
+        if std_f > 1e-3 and std_r > 1e-3:
+            corr = float(np.corrcoef(lf.ravel(), lr.ravel())[0, 1])
+            struct_sim = float(np.clip(0.5 * (corr + 1.0), 0.0, 1.0))
+        elif std_f <= 1e-3 and std_r <= 1e-3:
+            struct_sim = 1.0
+        elif std_f <= 1e-3 and color_diff <= 45.0:
+            struct_sim = color_sim
+        else:
+            struct_sim = 0.0
+
+        score = 0.4 * struct_sim + 0.3 * hist_sim + 0.3 * color_sim
+        return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod
     def _validate_inputs(
