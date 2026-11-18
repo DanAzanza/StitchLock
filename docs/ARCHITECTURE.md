@@ -1,10 +1,10 @@
 # StitchLocker (`garment-fix-pipeline`): Systems Architecture & Mathematical Reference
 
-This document details the engineering and mathematical foundations of **StitchLocker (`garment-fix-pipeline`)**: how the pipeline guarantees **0.0000% pixel alteration** outside the corrected garment region while leveraging **Qwen-Image 2.1 DiT** and headless **ComfyUI** execution.
+This document details the engineering and mathematical foundations of **StitchLocker (`garment-fix-pipeline`)**: how the pipeline enforces **0.0000% pixel drift** outside the corrected garment region in the decoded 8-bit RGB buffer while leveraging **Qwen-Image 2.1 DiT** and headless **ComfyUI** execution.
 
 ---
 
-## 1. Mathematical Proof of Zero-Loss Unmasked Pixel Preservation
+## 1. Unmasked RGB Pixel-Lock & 2D Windowed Verification
 
 Standard latent diffusion pipelines pass an entire image $I_{\text{orig}} \in \{0, \dots, 255\}^{H \times W \times 3}$ through a variational autoencoder ($\text{VAE}_{\text{dec}}(\text{VAE}_{\text{enc}}(I_{\text{orig}}))$). Because the latent bottleneck compresses spatial dimensions by $8\times$, every unmasked pixel $(y, x)$ suffers reconstruction drift:
 
@@ -22,15 +22,22 @@ By construction, $D(y, x) = 0$ for every pixel where $M_{\text{bin}}(y, x) = 0$,
 
 $$t(y, x) = \text{clip}\!\left(\frac{D(y, x)}{w_{\text{ramp}}}, 0, 1\right), \quad \alpha(y, x) = \begin{cases} 3 t(y, x)^2 - 2 t(y, x)^3 & \text{if } M_{\text{bin}}(y, x) = 1 \\ 0 & \text{if } M_{\text{bin}}(y, x) = 0 \end{cases}$$
 
-### 1.2 Hard Bitwise Pixel-Lock Compositing (`src/compositor.py`)
+### 1.2 Hard Bitwise Pixel-Lock Compositing & ICC/RGBA Preservation (`src/compositor.py`, `src/pipeline.py`)
 
-After blending the restored $1024 \times 1024$ ROI into the context window, `PixelLockCompositor.composite` applies a hard piecewise selection guard:
+After blending the restored ROI into the context window, `PixelLockCompositor.composite` applies a hard piecewise selection guard in the decoded 8-bit RGB buffer:
 
 $$I_{\text{final}}(y, x, c) = \begin{cases} \text{round}\big(\alpha(y, x) I_{\text{restored}}(y, x, c) + (1 - \alpha(y, x)) I_{\text{orig}}(y, x, c)\big) & \text{if } M_{\text{bin}}(y, x) = 1 \\ I_{\text{orig}}(y, x, c) & \text{if } M_{\text{bin}}(y, x) = 0 \end{cases}$$
 
-Consequently, over the entire unmasked domain $\Omega_{\text{unmasked}} = \{(y, x) \mid M_{\text{bin}}(y, x) = 0\}$:
+Consequently, over the entire unmasked domain $\Omega_{\text{unmasked}} = \{(y, x) \mid M_{\text{bin}}(y, x) = 0\}$ in the decoded 8-bit RGB buffer:
 
-$$\max_{(y, x) \in \Omega_{\text{unmasked}}, \, c \in \{R, G, B\}} \left| I_{\text{final}}(y, x, c) - I_{\text{orig}}(y, x, c) \right| = 0, \quad \text{SSIM}(\Omega_{\text{unmasked}}) = 1.0000$$
+$$\max_{(y, x) \in \Omega_{\text{unmasked}}, \, c \in \{R, G, B\}} \left| I_{\text{final}}(y, x, c) - I_{\text{orig}}(y, x, c) \right| = 0, \quad \text{SSIM}_{11\times 11}(\Omega_{\text{unmasked}}) = 1.0000$$
+
+On lossless PNG export, `src/pipeline.py` also captures and re-attaches the original image's ICC color profile (`icc_profile`) and untouched RGBA alpha channel (`A` band) when present. (Note: inputs using 16-bit depth or lossy source encodings are normalized to 8-bit RGB/RGBA PNGs.)
+
+### 1.3 2D Gaussian-Windowed Unmasked SSIM & Masked Reference Similarity (`src/verifier.py`)
+
+- **Boundary-Isolated 2D Unmasked SSIM**: `PixelLockVerifier._compute_unmasked_ssim` computes a local $11 \times 11$ ($\sigma = 1.5$) Gaussian-windowed SSIM map over a canvas where masked pixels are replaced by `original_image`, preventing masked edits from bleeding across the mask perimeter when `strict_zero_outside_mask=False`.
+- **Masked-Region Non-Degeneracy & Reference Similarity**: `PixelLockVerifier._compute_masked_reference_similarity` checks that the repaired region did not collapse to an all-black or uniform flat patch and evaluates structural, histogram, and color similarity against the aligned reference crop (`masked_reference_similarity >= min_masked_similarity`).
 
 ---
 
@@ -59,5 +66,6 @@ To prevent this:
 
 ## 3. Zero-Recompression PNG Provenance Metadata (`src/metadata.py`)
 
-To comply with **EU AI Act Article 50** (machine-readable marking of AI-manipulated media) without risking pixel re-encoding drift:
-- `embed_png_provenance_metadata` parses the binary PNG stream (`IHDR` $\dots$ `IEND`), validates every chunk's IEEE 802.3 CRC32 checksum, strips proprietary ComfyUI `workflow`/`prompt` graphs, and injects `tEXt` provenance chunks (`Software`, `AI-Compliance`, `Pixel-Lock-Verified`, `Unmasked-Max-Diff`, `Unmasked-SSIM`) immediately before `IEND` **without decompressing or touching `IDAT` pixel data**.
+To support **EU AI Act Article 50** metadata workflows (machine-readable provenance tagging of AI-edited media) without risking pixel re-encoding drift:
+- `embed_png_provenance_metadata` parses the binary PNG stream (`IHDR` $\dots$ `IEND`), validates every chunk's IEEE 802.3 CRC32 checksum, strips proprietary ComfyUI `workflow`/`prompt` graphs, and injects `tEXt` provenance chunks (`Software`, `AI-Generated`, `AI-Compliance`, `Pixel-Lock-Verified`, `Unmasked-Max-Diff`, `Unmasked-SSIM`) immediately before `IEND` **without decompressing or touching `IDAT` pixel data** (and preserving existing `iCCP` color profile chunks).
+- Note that PNG `tEXt` chunks are standard non-cryptographic metadata (distinct from signed C2PA manifests or imperceptible watermarks) and can be stripped if a downstream service re-encodes the file.
