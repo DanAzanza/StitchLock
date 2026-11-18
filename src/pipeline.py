@@ -40,12 +40,42 @@ from src.vlm_inspector import Qwen3VLInspector, VLMInspectionResult
 REPORTS_SUBDIR = "_reports"
 
 
-def save_rgb_atomic(path: Path, array_rgb: NDArray[np.uint8]) -> None:
-    """Write RGB PNG image atomically via a temporary .part staging file."""
+def diff_heatmap_filename(case_id: str, amplification_factor: float = 4.0) -> str:
+    """Build deterministic heatmap filename encoding the amplification factor."""
+    factor_tag = max(1, int(round(amplification_factor)))
+    return f"{case_id}_diff_heatmap_x{factor_tag}.png"
+
+
+def extract_reference_detail_crop(
+    ref_rgb: NDArray[np.uint8], ref_detail_bbox: PixelBBox
+) -> NDArray[np.uint8]:
+    """Extract the localized reference detail patch defined by ref_detail_bbox."""
+    return ref_rgb[
+        ref_detail_bbox.y1 : ref_detail_bbox.y2,
+        ref_detail_bbox.x1 : ref_detail_bbox.x2,
+    ].copy()
+
+
+def save_rgb_atomic(
+    path: Path,
+    array_rgb: NDArray[np.uint8],
+    *,
+    alpha_channel: NDArray[np.uint8] | None = None,
+    icc_profile: bytes | None = None,
+) -> None:
+    """Write RGB/RGBA PNG image atomically via a temporary .part staging file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_dest = path.with_suffix(f"{path.suffix}.{os.getpid()}_{time.time_ns()}.part")
     try:
-        Image.fromarray(array_rgb, mode="RGB").save(temp_dest, format="PNG")
+        if alpha_channel is not None and alpha_channel.shape == array_rgb.shape[:2]:
+            rgba = np.dstack([array_rgb, alpha_channel])
+            pil_out = Image.fromarray(rgba, mode="RGBA")
+        else:
+            pil_out = Image.fromarray(array_rgb, mode="RGB")
+        if icc_profile is not None:
+            pil_out.save(temp_dest, format="PNG", icc_profile=icc_profile)
+        else:
+            pil_out.save(temp_dest, format="PNG")
         temp_dest.replace(path)
     finally:
         if temp_dest.exists():
@@ -76,6 +106,9 @@ def persist_correction_outputs(
     diff_heatmap_rgb: NDArray[np.uint8],
     metrics: VerificationMetrics,
     vlm_result: VLMInspectionResult | None = None,
+    diff_amplification_factor: float = 4.0,
+    alpha_channel: NDArray[np.uint8] | None = None,
+    icc_profile: bytes | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Persist corrected image directly in `outputs/<case_id>.png` and reports in `_reports/`."""
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -84,10 +117,17 @@ def persist_correction_outputs(
 
     corrected_path = resolve_safe_path(outputs_dir, f"{case_id}.png")
     report_path = resolve_safe_path(reports_dir, f"{case_id}_verification_report.png")
-    heatmap_path = resolve_safe_path(reports_dir, f"{case_id}_diff_heatmap_x50.png")
+    heatmap_path = resolve_safe_path(
+        reports_dir, diff_heatmap_filename(case_id, diff_amplification_factor)
+    )
     metrics_json_path = resolve_safe_path(reports_dir, f"{case_id}_metrics.json")
 
-    save_rgb_atomic(corrected_path, final_corrected_rgb)
+    save_rgb_atomic(
+        corrected_path,
+        final_corrected_rgb,
+        alpha_channel=alpha_channel,
+        icc_profile=icc_profile,
+    )
     embed_png_provenance_metadata(
         corrected_path,
         case_id=case_id,
@@ -257,12 +297,14 @@ class GarmentCorrectionPipeline:
         self._bridge = bridge or ComfyQwenBridge(config.comfyui, config.workflow_path)
         self._compositor = compositor or PixelLockCompositor()
         self._verifier = verifier or PixelLockVerifier(config.verification)
-        inspector_wf = config.workflow_path.parent / "qwen3_vl_inspector_api.json"
+        inspector_wf = config.resolved_inspector_workflow_path
         self._inspector = (
             inspector
             if inspector is not None
             else (
-                Qwen3VLInspector(config.comfyui, inspector_wf) if inspector_wf.is_file() else None
+                Qwen3VLInspector(config.comfyui, inspector_wf, heuristics=config.heuristics)
+                if inspector_wf.is_file()
+                else None
             )
         )
 
@@ -281,12 +323,12 @@ class GarmentCorrectionPipeline:
         model_path = resolve_safe_path(case_root, manifest.model_image_filename)
         ref_path = resolve_safe_path(case_root, manifest.reference_image_filename)
 
-        original_model_rgb = self._load_rgb(model_path)
+        original_model_rgb, model_alpha, model_icc = self._load_rgb_with_metadata(model_path)
         reference_product_rgb = self._load_rgb(ref_path)
 
         # Stage 0: Qwen3-VL-8B Automated Defect Inspection (when auto_vision strategy active)
         vlm_result: VLMInspectionResult | None = None
-        active_server = self._bridge._probe_live_server()
+        active_server = self._bridge.probe_live_server()
         defects: Sequence[DefectTarget]
         detection_prefix = ""
         if (
@@ -305,6 +347,8 @@ class GarmentCorrectionPipeline:
                     original_model_rgb=original_model_rgb,
                     reference_product_rgb=reference_product_rgb,
                     vlm_result=vlm_result,
+                    alpha_channel=model_alpha,
+                    icc_profile=model_icc,
                 )
             defects = vlm_result.resolved_defects
             detection_prefix = vlm_result.inspector_source
@@ -356,6 +400,9 @@ class GarmentCorrectionPipeline:
             binary_mask=localization.binary_mask,
             backend_used=backend_used,
             detection_method=localization.detection_method,
+            reference_crop=extract_reference_detail_crop(
+                reference_product_rgb, localization.ref_detail_bbox
+            ),
         )
 
         diff_heatmap_rgb = self._verifier.build_diff_heatmap(
@@ -382,6 +429,8 @@ class GarmentCorrectionPipeline:
             four_panel_report_rgb=four_panel_report_rgb,
             metrics=metrics,
             vlm_result=vlm_result,
+            alpha_channel=model_alpha,
+            icc_profile=model_icc,
         )
 
     def _finalize_no_defect_case(
@@ -390,6 +439,9 @@ class GarmentCorrectionPipeline:
         original_model_rgb: NDArray[np.uint8],
         reference_product_rgb: NDArray[np.uint8],
         vlm_result: VLMInspectionResult,
+        *,
+        alpha_channel: NDArray[np.uint8] | None = None,
+        icc_profile: bytes | None = None,
     ) -> CaseExecutionArtifact:
         """Short-circuit diffusion when Qwen3-VL detects no defect and keep original untouched."""
         height, width = original_model_rgb.shape[:2]
@@ -451,6 +503,8 @@ class GarmentCorrectionPipeline:
             four_panel_report_rgb=four_panel_report_rgb,
             metrics=metrics,
             vlm_result=vlm_result,
+            alpha_channel=alpha_channel,
+            icc_profile=icc_profile,
         )
 
     def _persist_case_artifacts(
@@ -465,6 +519,9 @@ class GarmentCorrectionPipeline:
         four_panel_report_rgb: NDArray[np.uint8],
         metrics: VerificationMetrics,
         vlm_result: VLMInspectionResult | None,
+        *,
+        alpha_channel: NDArray[np.uint8] | None = None,
+        icc_profile: bytes | None = None,
     ) -> CaseExecutionArtifact:
         """Persist corrected image flatly in `outputs/` and reports/metrics under `_reports/`."""
         reports_dir, corrected_path, report_path, metrics_json_path = persist_correction_outputs(
@@ -475,6 +532,9 @@ class GarmentCorrectionPipeline:
             diff_heatmap_rgb=diff_heatmap_rgb,
             metrics=metrics,
             vlm_result=vlm_result,
+            diff_amplification_factor=self._config.verification.diff_amplification_factor,
+            alpha_channel=alpha_channel,
+            icc_profile=icc_profile,
         )
 
         return CaseExecutionArtifact(
@@ -513,8 +573,31 @@ class GarmentCorrectionPipeline:
         return artifacts
 
     @staticmethod
-    def _load_rgb(path: Path) -> NDArray[np.uint8]:
+    def _load_rgb_with_metadata(
+        path: Path,
+    ) -> tuple[NDArray[np.uint8], NDArray[np.uint8] | None, bytes | None]:
         if not path.is_file():
             raise ConfigurationError(f"Image file not found: {path}")
         with Image.open(path) as img:
-            return np.asarray(img.convert("RGB"), dtype=np.uint8)
+            raw_icc = img.info.get("icc_profile")
+            icc_profile = (
+                raw_icc
+                if (
+                    img.mode in ("RGB", "RGBA")
+                    and isinstance(raw_icc, bytes)
+                    and len(raw_icc) >= 20
+                    and raw_icc[16:20] == b"RGB "
+                )
+                else None
+            )
+            alpha_channel = (
+                np.asarray(img.getchannel("A"), dtype=np.uint8).copy()
+                if "A" in img.getbands()
+                else None
+            )
+            rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+            return rgb, alpha_channel, icc_profile
+
+    @classmethod
+    def _load_rgb(cls, path: Path) -> NDArray[np.uint8]:
+        return cls._load_rgb_with_metadata(path)[0]

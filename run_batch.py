@@ -12,9 +12,9 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from setup_test_cases import setup_all_test_cases
 from src.auto_masker import discover_case_paths
 from src.comfy_launcher import stop_auto_started_server
+from src.fixtures import setup_all_test_cases
 from src.models import (
     MaskingStrategy,
     PipelineError,
