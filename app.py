@@ -780,13 +780,15 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
 
     selected_case_state = gr.State(value=first_case)
 
-    with gr.Row(elem_classes=["stitch-main-row"], equal_height=True):
+    with gr.Row(elem_classes=["stitch-main-row"], equal_height=False):
         # Column 1: Inbox Thumbnails (+ Add Look tile at the end)
         with gr.Column(scale=4, min_width=300, elem_classes=["stitch-sidebar"]):
             gr.Markdown("### Inbox")
-            with gr.Row():
-                refresh_inbox_btn = gr.Button("Refresh", size="sm")
-                run_batch_btn = gr.Button("Run All (Batch)", variant="primary", size="sm")
+            with gr.Row(elem_classes=["stitch-inbox-actions"], equal_height=False):
+                refresh_inbox_btn = gr.Button("Refresh", size="sm", min_width=80)
+                run_batch_btn = gr.Button(
+                    "Run All (Batch)", variant="primary", size="sm", min_width=110
+                )
             inbox_gallery = gr.Gallery(
                 value=gallery_with_add_tile(initial_thumbs),
                 show_label=False,

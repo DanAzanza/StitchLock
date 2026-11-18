@@ -56,9 +56,32 @@ body {
     align-self: stretch !important;
 }
 
+.stitch-sidebar > *,
+.stitch-sidebar > .form > *,
+.stitch-workspace > *,
+.stitch-workspace > .form > * {
+    flex-grow: 0 !important;
+    flex-shrink: 0 !important;
+}
+
+.stitch-sidebar h3 {
+    margin: 0 !important;
+}
+
+.stitch-inbox-actions {
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 8px !important;
+    margin: 0 !important;
+}
+
+.stitch-inbox-actions > * {
+    min-width: 0 !important;
+    flex: 1 1 0% !important;
+}
+
 .stitch-sidebar > .styler,
 .stitch-sidebar > div:has([data-testid="gallery"]) {
-    flex: 1 1 auto !important;
     display: flex !important;
     flex-direction: column !important;
     min-height: 0 !important;
