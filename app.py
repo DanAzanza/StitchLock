@@ -1051,8 +1051,6 @@ def build_gradio_app(lifecycle: BrowserSessionLifecycle | None = None) -> Any:
 
 
 def main() -> None:
-    from gradio.themes import Soft
-
     parser = argparse.ArgumentParser(description="Launch Gradio Web UI for Garment Correction.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=7860, help="Bind port (default: 7860)")
@@ -1071,10 +1069,14 @@ def main() -> None:
     demo_started = False
     try:
         if cfg.comfyui.auto_launch:
+            print("[1/3] Checking ComfyUI backend...", flush=True)
             try:
                 ensure_comfyui_server(cfg.comfyui)
             except ComfyExecutionError as exc:
-                print(f"[WARNING] {exc}")
+                print(f"[WARNING] {exc}", flush=True)
+
+        print("[2/3] Loading StitchLocker Artist Studio UI...", flush=True)
+        from gradio.themes import Soft
 
         demo = build_gradio_app(lifecycle=lifecycle)
         theme = Soft(
@@ -1083,6 +1085,10 @@ def main() -> None:
             neutral_hue="slate",
         )
         css_paths = [str(UI_CSS_PATH)] if UI_CSS_PATH.is_file() else None
+        print(
+            f"[3/3] Opening StitchLocker Studio at http://{args.host}:{args.port} ...",
+            flush=True,
+        )
         demo.launch(
             server_name=args.host,
             server_port=args.port,
