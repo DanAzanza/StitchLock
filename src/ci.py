@@ -65,7 +65,7 @@ def run_all_ci_stages(
         return 1
 
     LOGGER.info("==================================================")
-    LOGGER.info("[ALL CI CHECKS PASSED] Local CI parity 100%% verified.")
+    LOGGER.info("[ALL CI CHECKS PASSED] Local CI parity 100% verified.")
     LOGGER.info("==================================================")
     return 0
 
