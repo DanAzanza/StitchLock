@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import time
 from collections.abc import Sequence
@@ -38,6 +39,21 @@ from src.verifier import PixelLockVerifier
 from src.vlm_inspector import Qwen3VLInspector, VLMInspectionResult
 
 REPORTS_SUBDIR = "_reports"
+LOGGER = logging.getLogger("garment_fix.pipeline")
+
+
+def extract_padded_roi(
+    image_rgb: NDArray[np.uint8], bbox: PixelBBox, pad_ratio: float = 0.08
+) -> NDArray[np.uint8]:
+    """Extract a context-padded detail crop around bbox for high-resolution VLM inspection."""
+    h, w = image_rgb.shape[:2]
+    pad_x = max(8, int(round(w * pad_ratio)))
+    pad_y = max(8, int(round(h * pad_ratio)))
+    x1 = max(0, bbox.x1 - pad_x)
+    y1 = max(0, bbox.y1 - pad_y)
+    x2 = min(w, bbox.x2 + pad_x)
+    y2 = min(h, bbox.y2 + pad_y)
+    return image_rgb[y1:y2, x1:x2].copy()
 
 
 def diff_heatmap_filename(case_id: str, amplification_factor: float = 4.0) -> str:
@@ -152,6 +168,47 @@ def persist_correction_outputs(
         save_json_atomic(vlm_json_path, vlm_result.to_dict())
 
     return reports_dir, corrected_path, report_path, metrics_json_path
+
+
+def run_vlm_post_check(
+    *,
+    inspector: Qwen3VLInspector | None,
+    active_server: str | None,
+    metrics: VerificationMetrics,
+    manifest: CaseManifest,
+    final_corrected_rgb: NDArray[np.uint8],
+    reference_product_rgb: NDArray[np.uint8],
+    localization: LocalizationResult,
+    defect_count: int,
+) -> VerificationMetrics:
+    """Run fail-closed semantic/OCR VLM post-check when enabled in configuration."""
+    if inspector is None or active_server is None:
+        LOGGER.warning(
+            "VLM post-check enabled for '%s' but inspector or ComfyUI server is unavailable; "
+            "failing closed.",
+            manifest.case_id,
+        )
+        return replace(metrics, passed=False, vlm_post_check_passed=False)
+
+    if defect_count == 1:
+        repaired_view = extract_padded_roi(final_corrected_rgb, localization.target_bbox)
+        ref_view = extract_padded_roi(reference_product_rgb, localization.ref_detail_bbox)
+    else:
+        repaired_view = final_corrected_rgb
+        ref_view = reference_product_rgb
+
+    vlm_ok, vlm_reason = inspector.verify_repaired_detail(
+        repaired_rgb=repaired_view,
+        ref_rgb=ref_view,
+        target_detail=manifest.target_detail,
+        case_id=manifest.case_id,
+        server_url=active_server,
+    )
+    if vlm_ok:
+        LOGGER.info("VLM post-check passed for '%s': %s", manifest.case_id, vlm_reason)
+    else:
+        LOGGER.warning("VLM post-check failed for '%s': %s", manifest.case_id, vlm_reason)
+    return replace(metrics, passed=metrics.passed and vlm_ok, vlm_post_check_passed=vlm_ok)
 
 
 @dataclass(frozen=True)
@@ -354,6 +411,7 @@ class GarmentCorrectionPipeline:
             detection_prefix = vlm_result.inspector_source
             manifest = replace(
                 manifest,
+                target_detail=vlm_result.defect_summary or manifest.target_detail,
                 model_target_box=vlm_result.model_target_box,
                 reference_detail_box=vlm_result.reference_detail_box,
                 prompt=vlm_result.edit_prompt or manifest.prompt,
@@ -404,6 +462,16 @@ class GarmentCorrectionPipeline:
                 reference_product_rgb, localization.ref_detail_bbox
             ),
         )
+        if self._config.verification.enable_vlm_post_check:
+            metrics = self._run_vlm_post_check(
+                metrics=metrics,
+                manifest=manifest,
+                final_corrected_rgb=final_corrected_rgb,
+                reference_product_rgb=reference_product_rgb,
+                localization=localization,
+                defect_count=len(defects),
+                active_server=active_server,
+            )
 
         diff_heatmap_rgb = self._verifier.build_diff_heatmap(
             original_image=original_model_rgb,
@@ -431,6 +499,29 @@ class GarmentCorrectionPipeline:
             vlm_result=vlm_result,
             alpha_channel=model_alpha,
             icc_profile=model_icc,
+        )
+
+    def _run_vlm_post_check(
+        self,
+        *,
+        metrics: VerificationMetrics,
+        manifest: CaseManifest,
+        final_corrected_rgb: NDArray[np.uint8],
+        reference_product_rgb: NDArray[np.uint8],
+        localization: LocalizationResult,
+        defect_count: int,
+        active_server: str | None,
+    ) -> VerificationMetrics:
+        """Delegate post-repair semantic/OCR VLM check to shared fail-closed helper."""
+        return run_vlm_post_check(
+            inspector=self._inspector,
+            active_server=active_server,
+            metrics=metrics,
+            manifest=manifest,
+            final_corrected_rgb=final_corrected_rgb,
+            reference_product_rgb=reference_product_rgb,
+            localization=localization,
+            defect_count=defect_count,
         )
 
     def _finalize_no_defect_case(

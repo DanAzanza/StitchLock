@@ -326,7 +326,7 @@ class PixelLockVerifier:
         )
         if patch_ref.size == 0:
             return 0.0
-        pr_64 = cv2.resize(patch_ref, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+        pr_128 = cls._resize_adaptive(patch_ref, (128, 128))
 
         mask_u8 = masked_bool.astype(np.uint8) * 255
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_u8)
@@ -344,46 +344,121 @@ class PixelLockVerifier:
             boxes = [(y1, y2, x1, x2)]
 
         island_scores = [
-            cls._score_masked_island(final_image[iy1:iy2, ix1:ix2], pr_64)
+            cls._score_masked_island(final_image[iy1:iy2, ix1:ix2], patch_ref, pr_128)
             for iy1, iy2, ix1, ix2 in boxes
         ]
         return float(np.clip(max(island_scores), 0.0, 1.0))
 
     @staticmethod
-    def _score_masked_island(patch_final: NDArray[np.uint8], pr_64: NDArray[np.float32]) -> float:
+    def _resize_adaptive(img: NDArray[np.uint8], size: tuple[int, int]) -> NDArray[np.float32]:
+        interp = (
+            cv2.INTER_AREA
+            if img.shape[0] >= size[1] and img.shape[1] >= size[0]
+            else cv2.INTER_LINEAR
+        )
+        return np.asarray(cv2.resize(img, size, interpolation=interp), dtype=np.float32)
+
+    @staticmethod
+    def _crop_salient_graphic(patch_u8: NDArray[np.uint8]) -> NDArray[np.uint8]:
+        """Trim uniform cloth margins so dilation padding matches tight reference crops."""
+        pf = patch_u8.astype(np.float32)
+        if pf.shape[0] < 8 or pf.shape[1] < 8:
+            return patch_u8
+        border = np.concatenate([pf[0, :, :], pf[-1, :, :], pf[:, 0, :], pf[:, -1, :]], axis=0)
+        cloth = np.median(border, axis=0)
+        dist = np.linalg.norm(pf - cloth.reshape(1, 1, 3), axis=2)
+        thr = max(25.0, float(np.percentile(dist, 80)))
+        ys, xs = np.where(dist >= thr)
+        if xs.size < 16 or ys.size < 16:
+            return patch_u8
+        pad = 2
+        y1, y2 = max(0, int(ys.min()) - pad), min(pf.shape[0], int(ys.max()) + 1 + pad)
+        x1, x2 = max(0, int(xs.min()) - pad), min(pf.shape[1], int(xs.max()) + 1 + pad)
+        if (y2 - y1) < 6 or (x2 - x1) < 6:
+            return patch_u8
+        return patch_u8[y1:y2, x1:x2]
+
+    @staticmethod
+    def _compute_2d_patch_ssim(lf: NDArray[np.float32], lr: NDArray[np.float32]) -> float:
+        c1 = (0.01 * 255.0) ** 2
+        c2 = (0.03 * 255.0) ** 2
+        ksize = (11, 11)
+        sigma = 1.5
+        mx = np.asarray(cv2.GaussianBlur(lf, ksize, sigma), dtype=np.float32)
+        my = np.asarray(cv2.GaussianBlur(lr, ksize, sigma), dtype=np.float32)
+        sx2 = np.maximum(
+            0.0, np.asarray(cv2.GaussianBlur(lf * lf, ksize, sigma), dtype=np.float32) - mx * mx
+        )
+        sy2 = np.maximum(
+            0.0, np.asarray(cv2.GaussianBlur(lr * lr, ksize, sigma), dtype=np.float32) - my * my
+        )
+        sxy = np.asarray(cv2.GaussianBlur(lf * lr, ksize, sigma), dtype=np.float32) - mx * my
+        num = (2.0 * mx * my + c1) * (2.0 * sxy + c2)
+        den = np.maximum((mx * mx + my * my + c1) * (sx2 + sy2 + c2), 1e-12)
+        return float(np.clip(np.mean(num / den), 0.0, 1.0))
+
+    @staticmethod
+    def _compute_sobel_edge_ncc(lf: NDArray[np.float32], lr: NDArray[np.float32]) -> float:
+        ef = np.hypot(
+            np.asarray(cv2.Sobel(lf, cv2.CV_32F, 1, 0, ksize=3), dtype=np.float32),
+            np.asarray(cv2.Sobel(lf, cv2.CV_32F, 0, 1, ksize=3), dtype=np.float32),
+        )
+        er = np.hypot(
+            np.asarray(cv2.Sobel(lr, cv2.CV_32F, 1, 0, ksize=3), dtype=np.float32),
+            np.asarray(cv2.Sobel(lr, cv2.CV_32F, 0, 1, ksize=3), dtype=np.float32),
+        )
+        if float(np.std(ef)) <= 1e-3 or float(np.std(er)) <= 1e-3:
+            return 0.0
+        corr = float(np.corrcoef(ef.ravel(), er.ravel())[0, 1])
+        return max(0.0, corr) if np.isfinite(corr) else 0.0
+
+    @classmethod
+    def _score_masked_island(
+        cls,
+        patch_final: NDArray[np.uint8],
+        patch_ref: NDArray[np.uint8],
+        pr_full: NDArray[np.float32],
+    ) -> float:
         if patch_final.size == 0:
             return 0.0
-        if float(np.mean(patch_final)) < 2.0 and float(np.mean(pr_64)) > 10.0:
+        if float(np.mean(patch_final)) < 2.0 and float(np.mean(pr_full)) > 10.0:
             return 0.0
 
-        pf_64 = cv2.resize(patch_final, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+        pf_full = cls._resize_adaptive(patch_final, (128, 128))
         color_diff = float(
-            np.mean(np.abs(np.mean(pf_64, axis=(0, 1)) - np.mean(pr_64, axis=(0, 1))))
+            np.mean(np.abs(np.mean(pf_full, axis=(0, 1)) - np.mean(pr_full, axis=(0, 1))))
         )
         color_sim = max(0.0, 1.0 - color_diff / 255.0)
-        if float(np.std(pf_64)) < 1e-3 and float(np.std(pr_64)) > 5.0 and color_diff > 45.0:
-            return 0.0
 
-        lf = cv2.cvtColor(pf_64, cv2.COLOR_RGB2GRAY)
-        lr = cv2.cvtColor(pr_64, cv2.COLOR_RGB2GRAY)
-        hf, _ = np.histogram(lf, bins=16, range=(0.0, 256.0))
-        hr, _ = np.histogram(lr, bins=16, range=(0.0, 256.0))
+        lf_full = np.asarray(cv2.cvtColor(pf_full, cv2.COLOR_RGB2GRAY), dtype=np.float32)
+        lr_full = np.asarray(cv2.cvtColor(pr_full, cv2.COLOR_RGB2GRAY), dtype=np.float32)
+        hf, _ = np.histogram(lf_full, bins=16, range=(0.0, 256.0))
+        hr, _ = np.histogram(lr_full, bins=16, range=(0.0, 256.0))
         hf_norm = hf.astype(np.float32) / max(1.0, float(hf.sum()))
         hr_norm = hr.astype(np.float32) / max(1.0, float(hr.sum()))
         hist_sim = float(np.sum(np.minimum(hf_norm, hr_norm)))
 
-        std_f, std_r = float(np.std(lf)), float(np.std(lr))
-        if std_f > 1e-3 and std_r > 1e-3:
-            corr = float(np.corrcoef(lf.ravel(), lr.ravel())[0, 1])
-            struct_sim = float(np.clip(0.5 * (corr + 1.0), 0.0, 1.0))
-        elif std_f <= 1e-3 and std_r <= 1e-3:
-            struct_sim = 1.0
-        elif std_f <= 1e-3 and color_diff <= 45.0:
-            struct_sim = color_sim
-        else:
-            struct_sim = 0.0
+        gx_r = np.asarray(cv2.Sobel(lr_full, cv2.CV_32F, 1, 0, ksize=3), dtype=np.float32)
+        gy_r = np.asarray(cv2.Sobel(lr_full, cv2.CV_32F, 0, 1, ksize=3), dtype=np.float32)
+        mag_r = np.hypot(gx_r, gy_r)
+        is_plain_ref = float(np.std(lr_full)) <= 12.0 and float(np.mean(mag_r)) < 10.0
+        if is_plain_ref:
+            rgb_spatial_std = float(np.max(np.std(pf_full, axis=(0, 1))))
+            unif_sim = max(0.0, 1.0 - max(0.0, rgb_spatial_std - 12.0) / 64.0)
+            score = 0.45 * color_sim + 0.35 * hist_sim + 0.20 * unif_sim
+            return float(np.clip(score, 0.0, 1.0))
 
-        score = 0.4 * struct_sim + 0.3 * hist_sim + 0.3 * color_sim
+        if float(np.std(pf_full)) < 1e-3 and color_diff > 45.0:
+            return 0.0
+
+        cf = cls._resize_adaptive(cls._crop_salient_graphic(patch_final), (128, 128))
+        cr = cls._resize_adaptive(cls._crop_salient_graphic(patch_ref), (128, 128))
+        lf = np.asarray(cv2.cvtColor(cf, cv2.COLOR_RGB2GRAY), dtype=np.float32)
+        lr = np.asarray(cv2.cvtColor(cr, cv2.COLOR_RGB2GRAY), dtype=np.float32)
+        ssim_val = cls._compute_2d_patch_ssim(lf, lr)
+        edge_sim = cls._compute_sobel_edge_ncc(lf, lr)
+
+        score = 0.35 * ssim_val + 0.40 * edge_sim + 0.15 * color_sim + 0.10 * hist_sim
         return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod

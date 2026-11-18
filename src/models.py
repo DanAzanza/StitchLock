@@ -179,6 +179,7 @@ class VerificationConfig:
     diff_amplification_factor: float = 4.0
     strict_zero_outside_mask: bool = True
     min_masked_similarity: float = 0.0
+    enable_vlm_post_check: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,10 +239,11 @@ class VerificationMetrics:
     backend_used: str
     detection_method: str
     masked_reference_similarity: float = 1.0
+    vlm_post_check_passed: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize metrics to a JSON-compatible dictionary."""
-        return {
+        payload: dict[str, Any] = {
             "case_id": self.case_id,
             "status": "PASS" if self.passed else "FAIL",
             "passed": self.passed,
@@ -259,6 +261,9 @@ class VerificationMetrics:
             "detection_method": self.detection_method,
             "masked_reference_similarity": round(self.masked_reference_similarity, 4),
         }
+        if self.vlm_post_check_passed is not None:
+            payload["vlm_post_check_passed"] = self.vlm_post_check_passed
+        return payload
 
 
 def resolve_safe_path(root: Path, candidate: Path | str) -> Path:
@@ -334,6 +339,7 @@ def load_pipeline_config(config_path: Path, base_dir: Path | None = None) -> Pip
             diff_amplification_factor=float(ver_raw.get("diff_amplification_factor", 4.0)),
             strict_zero_outside_mask=bool(ver_raw.get("strict_zero_outside_mask", True)),
             min_masked_similarity=min_masked_sim,
+            enable_vlm_post_check=bool(ver_raw.get("enable_vlm_post_check", False)),
         ),
         heuristics=HeuristicConfig(
             min_graphic_contrast_std=float(heur_raw.get("min_graphic_contrast_std", 14.0)),

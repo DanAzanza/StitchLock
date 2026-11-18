@@ -23,3 +23,4 @@ verification:
   diff_amplification_factor: 4.0
   strict_zero_outside_mask: true
   min_masked_similarity: 0.15
+  enable_vlm_post_check: false

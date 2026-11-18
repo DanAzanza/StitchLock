@@ -34,13 +34,9 @@ from src.models import (
 )
 from src.vlm_heuristics import (
     detect_micro_emblem_defect,
-    emblem_pattern_correlation,
     find_salient_emblem_box,
-    find_salient_ref_bounds,
     has_graphic_contrast,
     refine_connected_graphic_box,
-    sample_studio_bg_rgb,
-    segment_garment_bounds,
     split_misplaced_defect_if_shifted,
     tighten_ref_box_to_salient,
 )
@@ -99,6 +95,16 @@ DEFAULT_INSPECTION_PROMPT = (
     '{"defect_summary": "...", "model_bbox_2d": [xmin, ymin, xmax, ymax], '
     '"ref_bbox_2d": [xmin, ymin, xmax, ymax], '
     '"edit_prompt": "Edit <image1>: Replace ... with ..."}]}'
+)
+
+POST_CHECK_PROMPT = (
+    "Compare Image 1 (repaired On-Model detail) and Image 2 (authentic Product Reference).\n"
+    "Target detail context: {target_detail}\n"
+    "Verify STRICTLY whether the repaired garment logo, typography, colors, and emblem shapes "
+    "in Image 1 match Image 2 accurately without misspelled letters, extra shapes, or "
+    "un-erased remnants.\n"
+    'Respond ONLY with valid JSON: {{"passed": true, "reason": "..."}} '
+    'or {{"passed": false, "reason": "..."}}'
 )
 
 
@@ -305,6 +311,53 @@ class Qwen3VLInspector:
             if "text" in node_out and node_out["text"]:
                 return str(node_out["text"][0])
         raise ComfyExecutionError(f"No text output from Qwen3-VL for case '{case_id}'.")
+
+    @staticmethod
+    def parse_post_check_json(raw_text: str) -> tuple[bool, str]:
+        """Parse Qwen3-VL semantic/OCR post-check JSON with strict fail-closed validation."""
+        match = re.search(r"\{.*\}", raw_text.strip(), flags=re.DOTALL)
+        if not match:
+            return False, "Malformed VLM post-check response: missing JSON object."
+        try:
+            data: Any = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            return False, f"Malformed VLM post-check JSON: {exc}"
+        if not isinstance(data, dict):
+            return False, "Malformed VLM post-check JSON: expected object."
+        passed_val = data.get("passed")
+        if not isinstance(passed_val, bool):
+            return False, "Malformed VLM post-check JSON: 'passed' must be a boolean."
+        reason = str(data.get("reason", "")).strip() or (
+            "VLM semantic post-check passed." if passed_val else "VLM semantic post-check failed."
+        )
+        return passed_val, reason
+
+    def verify_repaired_detail(
+        self,
+        repaired_rgb: NDArray[np.uint8],
+        ref_rgb: NDArray[np.uint8],
+        target_detail: str,
+        case_id: str,
+        server_url: str | None = None,
+    ) -> tuple[bool, str]:
+        """Verify repaired garment detail semantically against reference using Qwen3-VL."""
+        if server_url is None:
+            raise ComfyExecutionError(
+                f"Cannot run Qwen3-VL post-check for case '{case_id}': ComfyUI server is offline."
+            )
+        run_token = uuid.uuid4().hex[:8]
+        m_name = upload_png_bytes(
+            server_url, f"vlm_post_rep_{case_id}_{run_token}.png", encode_png_rgb(repaired_rgb)
+        )
+        r_name = upload_png_bytes(
+            server_url, f"vlm_post_ref_{case_id}_{run_token}.png", encode_png_rgb(ref_rgb)
+        )
+        workflow = copy.deepcopy(self._workflow_template)
+        workflow["1"]["inputs"]["image"] = m_name
+        workflow["2"]["inputs"]["image"] = r_name
+        workflow["4"]["inputs"]["prompt"] = POST_CHECK_PROMPT.format(target_detail=target_detail)
+        raw_text = self._execute_vlm_workflow(server_url, workflow, f"{case_id}_post_check")
+        return self.parse_post_check_json(raw_text)
 
     @classmethod
     def parse_vlm_json_response(
@@ -565,21 +618,7 @@ class Qwen3VLInspector:
             return fallback
         return NormalizedBox(0.30, 0.30, 0.70, 0.70)
 
-    # Delegating CV heuristic wrappers preserved for backward compatibility
-    @staticmethod
-    def _sample_studio_bg_rgb(image_rgb: NDArray[np.uint8]) -> NDArray[np.float32]:
-        return sample_studio_bg_rgb(image_rgb)
-
-    @staticmethod
-    def _has_graphic_contrast(image_rgb: NDArray[np.uint8], box: NormalizedBox) -> bool:
-        return has_graphic_contrast(image_rgb, box)
-
-    @staticmethod
-    def _tighten_ref_box_to_salient(
-        ref_rgb: NDArray[np.uint8], ref_box: NormalizedBox
-    ) -> NormalizedBox:
-        return tighten_ref_box_to_salient(ref_rgb, ref_box)
-
+    # Delegating CV heuristic wrappers preserved for test/caller compatibility
     @staticmethod
     def _refine_connected_graphic_box(
         image_rgb: NDArray[np.uint8],
@@ -588,30 +627,6 @@ class Qwen3VLInspector:
         heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
     ) -> NormalizedBox:
         return refine_connected_graphic_box(image_rgb, vlm_box, prior_box, heuristics=heuristics)
-
-    @staticmethod
-    def _segment_garment_bounds(
-        model_rgb: NDArray[np.uint8], ref_rgb: NDArray[np.uint8]
-    ) -> (
-        tuple[
-            tuple[float, float, float, float],
-            tuple[float, float, float, float],
-            NDArray[np.float32],
-            NDArray[np.float32],
-            NDArray[np.uint8],
-        ]
-        | None
-    ):
-        return segment_garment_bounds(model_rgb, ref_rgb)
-
-    @staticmethod
-    def _find_salient_ref_bounds(
-        ref_rgb: NDArray[np.uint8],
-        ref_box: NormalizedBox,
-        rbg: NDArray[np.float32],
-        ref_cloth: NDArray[np.float32],
-    ) -> tuple[float, float, float, float]:
-        return find_salient_ref_bounds(ref_rgb, ref_box, rbg, ref_cloth)
 
     @staticmethod
     def _split_misplaced_defect_if_shifted(
@@ -627,15 +642,6 @@ class Qwen3VLInspector:
         image_rgb: NDArray[np.uint8], hint_box: NormalizedBox
     ) -> NormalizedBox | None:
         return find_salient_emblem_box(image_rgb, hint_box)
-
-    @staticmethod
-    def _emblem_pattern_correlation(
-        model_rgb: NDArray[np.uint8],
-        m_box: NormalizedBox,
-        ref_rgb: NDArray[np.uint8],
-        r_box: NormalizedBox,
-    ) -> float:
-        return emblem_pattern_correlation(model_rgb, m_box, ref_rgb, r_box)
 
     @staticmethod
     def _detect_micro_emblem_defect(
