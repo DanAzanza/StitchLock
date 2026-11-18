@@ -1,4 +1,4 @@
-"""Stage 1A: Qwen3-VL-8B Automated Garment Defect Inspector & Visual Grounding Engine.
+"""Stage 0: Qwen3-VL-8B Automated Garment Defect Inspector & Visual Grounding Engine.
 
 Uses ComfyUI's built-in `TextGenerateV2` node running on the shared `qwen3vl_8b_int8_convrot`
 checkpoint (0 MB extra VRAM) to automatically:
@@ -11,26 +11,53 @@ checkpoint (0 MB extra VRAM) to automatically:
 from __future__ import annotations
 
 import copy
-import io
 import json
+import logging
 import re
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
-import cv2
 import numpy as np
 import requests
 import websocket
 from numpy.typing import NDArray
-from PIL import Image
 
-from src.models import ComfyConfig, ComfyExecutionError, DefectTarget, NormalizedBox
+from src.comfy_client import encode_png_rgb, execute_comfy_prompt, upload_png_bytes
+from src.models import (
+    ComfyConfig,
+    ComfyExecutionError,
+    DefectTarget,
+    HeuristicConfig,
+    NormalizedBox,
+)
+from src.vlm_heuristics import (
+    detect_micro_emblem_defect,
+    emblem_pattern_correlation,
+    find_salient_emblem_box,
+    find_salient_ref_bounds,
+    has_graphic_contrast,
+    refine_connected_graphic_box,
+    sample_studio_bg_rgb,
+    segment_garment_bounds,
+    split_misplaced_defect_if_shifted,
+    tighten_ref_box_to_salient,
+)
 
+LOGGER = logging.getLogger("garment_fix.vlm_inspector")
+_DEFAULT_HEURISTICS = HeuristicConfig()
 MAX_DEFECTS_PER_IMAGE = 4
+
+_LOOKUP_FALLBACK_ERRORS = (
+    ComfyExecutionError,
+    requests.RequestException,
+    websocket.WebSocketException,
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+    OSError,
+)
 
 DEFAULT_INSPECTION_PROMPT = (
     "Compare Image 1 (generated On-Model photo) and Image 2 "
@@ -130,9 +157,15 @@ class VLMInspectionResult:
 class Qwen3VLInspector:
     """Executes zero-shot garment defect detection and localization via Qwen3-VL-8B in ComfyUI."""
 
-    def __init__(self, comfy_config: ComfyConfig, inspector_workflow_path: Path) -> None:
+    def __init__(
+        self,
+        comfy_config: ComfyConfig,
+        inspector_workflow_path: Path,
+        heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
+    ) -> None:
         self._config = comfy_config
         self._workflow_path = inspector_workflow_path
+        self._heuristics = heuristics
         with inspector_workflow_path.open("r", encoding="utf-8") as handle:
             self._workflow_template: dict[str, Any] = json.load(handle)
 
@@ -158,6 +191,7 @@ class Qwen3VLInspector:
             model_rgb=model_rgb,
             ref_rgb=ref_rgb,
             source_label=f"qwen3_vl_8b ({server_url})",
+            heuristics=self._heuristics,
         )
         if not parsed.has_defect:
             return parsed
@@ -165,8 +199,8 @@ class Qwen3VLInspector:
         refined_defects: list[DefectTarget] = []
         for idx, defect in enumerate(parsed.resolved_defects, start=1):
             ref_box = defect.reference_detail_box
-            if not self._is_erase_defect(defect.edit_prompt) and not self._has_graphic_contrast(
-                ref_rgb, ref_box
+            if not self._is_erase_defect(defect.edit_prompt) and not has_graphic_contrast(
+                ref_rgb, ref_box, heuristics=self._heuristics
             ):
                 located = self._locate_ref_detail_single_image(
                     server_url=server_url,
@@ -205,13 +239,12 @@ class Qwen3VLInspector:
     ) -> str:
         """Upload full-res pair and execute TextGenerateV2 on Qwen3-VL-8B."""
         run_token = uuid.uuid4().hex[:8]
-        try:
-            m_name = self._upload_rgb(server_url, f"vlm_model_{case_id}_{run_token}.png", model_rgb)
-            r_name = self._upload_rgb(server_url, f"vlm_ref_{case_id}_{run_token}.png", ref_rgb)
-        except Exception as exc:
-            raise ComfyExecutionError(
-                f"Failed to upload images for Qwen3-VL inspection on '{case_id}': {exc}"
-            ) from exc
+        m_name = upload_png_bytes(
+            server_url, f"vlm_model_{case_id}_{run_token}.png", encode_png_rgb(model_rgb)
+        )
+        r_name = upload_png_bytes(
+            server_url, f"vlm_ref_{case_id}_{run_token}.png", encode_png_rgb(ref_rgb)
+        )
 
         workflow = copy.deepcopy(self._workflow_template)
         workflow["1"]["inputs"]["image"] = m_name
@@ -229,25 +262,21 @@ class Qwen3VLInspector:
         """Locate graphic inside Image 2 solo when dual-view ref_box points at plain fabric."""
         run_token = uuid.uuid4().hex[:8]
         try:
-            r_name = self._upload_rgb(
-                server_url, f"vlm_ref_solo_{case_id}_{run_token}.png", ref_rgb
+            r_name = upload_png_bytes(
+                server_url, f"vlm_ref_solo_{case_id}_{run_token}.png", encode_png_rgb(ref_rgb)
             )
-        except Exception:
-            return None
-
-        workflow = copy.deepcopy(self._workflow_template)
-        workflow.pop("2", None)
-        workflow["1"]["inputs"]["image"] = r_name
-        inputs_4 = workflow["4"]["inputs"]
-        inputs_4.pop("images.image2", None)
-        inputs_4["prompt"] = (
-            f"Look at this garment photo and locate ONLY the target graphic described here: "
-            f"{target_description}\n"
-            "Return the tight 2D bounding box [xmin, ymin, xmax, ymax] on a 0 to 1000 scale "
-            "enclosing that graphic on this image.\n"
-            'Respond ONLY with JSON: {"bbox_2d": [xmin, ymin, xmax, ymax]}'
-        )
-        try:
+            workflow = copy.deepcopy(self._workflow_template)
+            workflow.pop("2", None)
+            workflow["1"]["inputs"]["image"] = r_name
+            inputs_4 = workflow["4"]["inputs"]
+            inputs_4.pop("images.image2", None)
+            inputs_4["prompt"] = (
+                f"Look at this garment photo and locate ONLY the target graphic described here: "
+                f"{target_description}\n"
+                "Return the tight 2D bounding box [xmin, ymin, xmax, ymax] on a 0 to 1000 scale "
+                "enclosing that graphic on this image.\n"
+                'Respond ONLY with JSON: {"bbox_2d": [xmin, ymin, xmax, ymax]}'
+            )
             raw = self._execute_vlm_workflow(server_url, workflow, f"{case_id}_ref_solo")
             match = re.search(r"\{.*\}", raw.strip(), flags=re.DOTALL)
             if not match:
@@ -255,159 +284,27 @@ class Qwen3VLInspector:
             data: dict[str, Any] = json.loads(match.group(0))
             coords = data.get("bbox_2d") or data.get("ref_bbox_2d") or data.get("model_bbox_2d")
             candidate = self._parse_box_1000(coords, None)
-            if self._has_graphic_contrast(ref_rgb, candidate):
-                return self._tighten_ref_box_to_salient(ref_rgb, candidate)
-        except Exception:
+            if has_graphic_contrast(ref_rgb, candidate, heuristics=self._heuristics):
+                return tighten_ref_box_to_salient(ref_rgb, candidate, heuristics=self._heuristics)
+        except _LOOKUP_FALLBACK_ERRORS as exc:
+            LOGGER.warning(
+                "Single-image reference lookup fallback failed for '%s': %s", case_id, exc
+            )
             return None
         return None
 
     def _execute_vlm_workflow(self, server_url: str, workflow: dict[str, Any], case_id: str) -> str:
-        """Execute a prepared TextGenerateV2 workflow graph against ComfyUI WebSocket/HTTP."""
-        client_id = str(uuid.uuid4())
-        parsed = urlparse(server_url)
-        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
-        ws_url = f"{ws_scheme}://{parsed.netloc}/ws?clientId={client_id}"
-
-        ws = websocket.WebSocket()
-        ws.settimeout(5.0)
-        try:
-            ws.connect(ws_url)
-        except Exception as exc:
-            raise ComfyExecutionError(f"Failed to connect VLM WebSocket: {exc}") from exc
-
-        try:
-            resp = requests.post(
-                f"{server_url}/prompt",
-                json={"prompt": workflow, "client_id": client_id},
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            prompt_id = str(resp.json()["prompt_id"])
-            self._wait_ws(ws, prompt_id, self._config.timeout_seconds)
-            hist = requests.get(f"{server_url}/history/{prompt_id}", timeout=15.0).json()
-        except ComfyExecutionError:
-            raise
-        except Exception as exc:
-            raise ComfyExecutionError(
-                f"Qwen3-VL ComfyUI execution failed for case '{case_id}': {exc}"
-            ) from exc
-        finally:
-            ws.close()
-
-        outputs = hist.get(prompt_id, {}).get("outputs", {})
+        """Execute a prepared TextGenerateV2 workflow graph using shared ComfyUI transport."""
+        outputs = execute_comfy_prompt(
+            server_url=server_url,
+            workflow=workflow,
+            timeout_s=self._config.timeout_seconds,
+            case_id=case_id,
+        )
         for node_out in outputs.values():
             if "text" in node_out and node_out["text"]:
                 return str(node_out["text"][0])
-
-        raise ComfyExecutionError(f"No text output from Qwen3-VL for prompt_id={prompt_id}")
-
-    @staticmethod
-    def _sample_studio_bg_rgb(image_rgb: NDArray[np.uint8]) -> NDArray[np.float32]:
-        """Estimate studio backdrop RGB from upper-left and upper-right image corners."""
-        h, w = image_rgb.shape[:2]
-        c_w = max(4, w // 20)
-        c_h = max(4, h // 20)
-        corners = np.concatenate(
-            [
-                image_rgb[0:c_h, 0:c_w, :].reshape(-1, 3),
-                image_rgb[0:c_h, w - c_w : w, :].reshape(-1, 3),
-            ],
-            axis=0,
-        )
-        return np.median(corners.astype(np.float32), axis=0)
-
-    @staticmethod
-    def _has_graphic_contrast(image_rgb: NDArray[np.uint8], box: NormalizedBox) -> bool:
-        """Return True if the localized crop contains visible graphic contrast vs. plain cloth."""
-        h, w = image_rgb.shape[:2]
-        px = box.to_pixel_bbox(w, h)
-        patch = image_rgb[px.y1 : px.y2, px.x1 : px.x2].astype(np.float32)
-        return float(np.std(patch)) >= 14.0
-
-    @classmethod
-    def _tighten_ref_box_to_salient(
-        cls, ref_rgb: NDArray[np.uint8], ref_box: NormalizedBox
-    ) -> NormalizedBox:
-        """Trim empty cloth and studio backdrop padding around ref_box color-agnostically."""
-        h, w = ref_rgb.shape[:2]
-        px = ref_box.to_pixel_bbox(w, h)
-        sx1 = max(0, px.x1 - int(0.03 * w))
-        sx2 = min(w, px.x2 + int(0.03 * w))
-        sy1 = max(0, px.y1 - int(0.06 * h))
-        sy2 = min(h, px.y2 + int(0.04 * h))
-        patch = ref_rgb[sy1:sy2, sx1:sx2].astype(np.float32)
-        if patch.shape[0] < 6 or patch.shape[1] < 6:
-            return ref_box
-
-        bg_med = cls._sample_studio_bg_rgb(ref_rgb)
-        diff_bg = np.linalg.norm(patch - bg_med.reshape(1, 1, 3), axis=2)
-        fg_pixels = patch[diff_bg > 28.0]
-        if fg_pixels.shape[0] >= 40:
-            cloth_med = np.median(fg_pixels, axis=0)
-            c_rg = float(cloth_med[0] - cloth_med[1])
-            c_gb = float(cloth_med[1] - cloth_med[2])
-            p_chroma = np.hypot(
-                (patch[:, :, 0] - patch[:, :, 1]) - c_rg,
-                (patch[:, :, 1] - patch[:, :, 2]) - c_gb,
-            )
-            diff_cloth = np.linalg.norm(patch - cloth_med.reshape(1, 1, 3), axis=2)
-            chroma_mask = (p_chroma > 15.0) & (diff_bg > 28.0)
-            salient_mask = (
-                chroma_mask
-                if int(np.count_nonzero(chroma_mask)) >= 40
-                else ((diff_cloth > 44.0) & (diff_bg > 28.0))
-            )
-        else:
-            border_px = np.concatenate(
-                [patch[0:2, :, :].reshape(-1, 3), patch[-2:, :, :].reshape(-1, 3)], axis=0
-            )
-            cloth_med = np.median(border_px, axis=0)
-            diff = np.linalg.norm(patch - cloth_med.reshape(1, 1, 3), axis=2)
-            salient_mask = diff > 32.0
-
-        ys, xs = np.where(salient_mask)
-        if xs.size < 25 or ys.size < 25:
-            return ref_box
-        nx1 = max(0.0, (sx1 + int(xs.min()) - 4) / float(w))
-        ny1 = max(0.0, (sy1 + int(ys.min()) - 4) / float(h))
-        nx2 = min(1.0, (sx1 + int(xs.max()) + 4) / float(w))
-        ny2 = min(1.0, (sy1 + int(ys.max()) + 4) / float(h))
-        if nx2 - nx1 < 0.02 or ny2 - ny1 < 0.02:
-            return ref_box
-        return NormalizedBox(nx1, ny1, nx2, ny2)
-
-    @staticmethod
-    def _upload_rgb(server_url: str, filename: str, rgb: NDArray[np.uint8]) -> str:
-        buf = io.BytesIO()
-        Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
-        resp = requests.post(
-            f"{server_url}/upload/image",
-            files={"image": (filename, buf.getvalue(), "image/png")},
-            data={"overwrite": "true"},
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        return str(resp.json()["name"])
-
-    @staticmethod
-    def _wait_ws(ws: websocket.WebSocket, prompt_id: str, timeout_s: float) -> None:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            try:
-                msg = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                continue
-            if not isinstance(msg, str):
-                continue
-            ev = json.loads(msg)
-            d = ev.get("data", {})
-            if d.get("prompt_id") != prompt_id:
-                continue
-            if ev.get("type") == "execution_error":
-                raise ComfyExecutionError(str(d.get("exception_message", "VLM error")))
-            if ev.get("type") == "executing" and d.get("node") is None:
-                return
-        raise ComfyExecutionError("Qwen3-VL execution timed out.")
+        raise ComfyExecutionError(f"No text output from Qwen3-VL for case '{case_id}'.")
 
     @classmethod
     def parse_vlm_json_response(
@@ -419,6 +316,7 @@ class Qwen3VLInspector:
         fallback_ref_box: NormalizedBox | None = None,
         fallback_prompt: str | None = None,
         source_label: str = "qwen3_vl_8b",
+        heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
     ) -> VLMInspectionResult:
         """Parse multi-defect or single-defect Qwen3-VL JSON and refine target boxes."""
         cleaned = raw_text.strip()
@@ -432,7 +330,9 @@ class Qwen3VLInspector:
 
         raw_entries = cls._extract_raw_defect_entries(data)
         if not has_defect or not raw_entries:
-            micro = cls._detect_micro_emblem_defect(model_rgb, ref_rgb, source_label)
+            micro = cls._detect_micro_emblem_defect(
+                model_rgb, ref_rgb, source_label, heuristics=heuristics
+            )
             if micro is not None:
                 return micro
             empty_box = fallback_model_box or NormalizedBox(0.30, 0.30, 0.70, 0.70)
@@ -456,12 +356,15 @@ class Qwen3VLInspector:
                 fallback_model_box=fallback_model_box if idx == 0 else None,
                 fallback_ref_box=fallback_ref_box if idx == 0 else None,
                 fallback_prompt=fallback_prompt if idx == 0 else None,
+                heuristics=heuristics,
             )
             for idx, entry in enumerate(raw_entries[: MAX_DEFECTS_PER_IMAGE * 2])
         ]
         deduped = cls._merge_overlapping_defects(parsed_defects)
         if len(deduped) == 1 and not cls._is_erase_defect(deduped[0].edit_prompt):
-            deduped = cls._split_misplaced_defect_if_shifted(model_rgb, ref_rgb, deduped)
+            deduped = cls._split_misplaced_defect_if_shifted(
+                model_rgb, ref_rgb, deduped, heuristics=heuristics
+            )
         ordered = sorted(
             deduped[:MAX_DEFECTS_PER_IMAGE],
             key=lambda d: (
@@ -505,6 +408,7 @@ class Qwen3VLInspector:
         fallback_model_box: NormalizedBox | None,
         fallback_ref_box: NormalizedBox | None,
         fallback_prompt: str | None,
+        heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
     ) -> DefectTarget:
         raw_m_box = entry.get("model_bbox_2d") or entry.get("model_bbox_1000")
         raw_r_box = entry.get("ref_bbox_2d") or entry.get("ref_bbox_1000")
@@ -512,11 +416,13 @@ class Qwen3VLInspector:
         m_box = cls._parse_box_1000(raw_m_box, fallback_model_box)
         r_box = cls._parse_box_1000(raw_r_box, fallback_ref_box)
 
-        m_box = cls._refine_connected_graphic_box(model_rgb, m_box, fallback_model_box)
+        m_box = cls._refine_connected_graphic_box(
+            model_rgb, m_box, fallback_model_box, heuristics=heuristics
+        )
         if fallback_ref_box is not None:
             r_box = fallback_ref_box
-        elif cls._has_graphic_contrast(ref_rgb, r_box):
-            r_box = cls._tighten_ref_box_to_salient(ref_rgb, r_box)
+        elif has_graphic_contrast(ref_rgb, r_box, heuristics=heuristics):
+            r_box = tighten_ref_box_to_salient(ref_rgb, r_box, heuristics=heuristics)
 
         summary = str(entry.get("defect_summary") or default_summary).strip()
         prompt = cls._normalize_edit_prompt(str(entry.get("edit_prompt", "")), fallback_prompt)
@@ -659,84 +565,33 @@ class Qwen3VLInspector:
             return fallback
         return NormalizedBox(0.30, 0.30, 0.70, 0.70)
 
-    @classmethod
+    # Delegating CV heuristic wrappers preserved for backward compatibility
+    @staticmethod
+    def _sample_studio_bg_rgb(image_rgb: NDArray[np.uint8]) -> NDArray[np.float32]:
+        return sample_studio_bg_rgb(image_rgb)
+
+    @staticmethod
+    def _has_graphic_contrast(image_rgb: NDArray[np.uint8], box: NormalizedBox) -> bool:
+        return has_graphic_contrast(image_rgb, box)
+
+    @staticmethod
+    def _tighten_ref_box_to_salient(
+        ref_rgb: NDArray[np.uint8], ref_box: NormalizedBox
+    ) -> NormalizedBox:
+        return tighten_ref_box_to_salient(ref_rgb, ref_box)
+
+    @staticmethod
     def _refine_connected_graphic_box(
-        cls,
         image_rgb: NDArray[np.uint8],
         vlm_box: NormalizedBox,
         prior_box: NormalizedBox | None,
+        heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
     ) -> NormalizedBox:
-        """Expand truncated VLM boxes to enclose connected graphic/signature components."""
-        if prior_box is not None:
-            cx = 0.5 * (vlm_box.x_min + vlm_box.x_max)
-            cy = 0.5 * (vlm_box.y_min + vlm_box.y_max)
-            if (
-                prior_box.x_min - 0.12 <= cx <= prior_box.x_max + 0.12
-                and prior_box.y_min - 0.12 <= cy <= prior_box.y_max + 0.12
-            ):
-                return prior_box
+        return refine_connected_graphic_box(image_rgb, vlm_box, prior_box, heuristics=heuristics)
 
-        padded = NormalizedBox(
-            max(0.0, vlm_box.x_min - 0.025),
-            max(0.0, vlm_box.y_min - 0.025),
-            min(1.0, vlm_box.x_max + 0.025),
-            min(1.0, vlm_box.y_max + 0.025),
-        )
-        h, w = image_rgb.shape[:2]
-        px = padded.to_pixel_bbox(w, h)
-        inner = image_rgb[px.y1 : px.y2, px.x1 : px.x2].astype(np.float32)
-        if inner.shape[0] < 12 or inner.shape[1] < 12:
-            return padded
-
-        cloth_med = np.median(inner.reshape(-1, 3), axis=0)
-        inner_salient = np.linalg.norm(inner - cloth_med.reshape(1, 1, 3), axis=2) > 45.0
-        if int(np.count_nonzero(inner_salient)) < 15:
-            return padded
-        graphic_med = np.median(inner[inner_salient], axis=0)
-        if float(np.linalg.norm(graphic_med - cloth_med)) < 45.0:
-            return padded
-
-        sy1, sy2 = px.y1, min(h, px.y2 + int(0.10 * h))
-        search = image_rgb[sy1:sy2, px.x1 : px.x2].astype(np.float32)
-        d_cloth = np.linalg.norm(search - cloth_med.reshape(1, 1, 3), axis=2)
-        d_graphic = np.linalg.norm(search - graphic_med.reshape(1, 1, 3), axis=2)
-        salient = ((d_cloth > 45.0) & (d_graphic < d_cloth * 0.85) & (d_graphic < 85.0)).astype(
-            np.uint8
-        )
-
-        k = max(5, int(round(min(h, w) * 0.022)))
-        bridged = cv2.dilate(salient, np.ones((k, k), np.uint8))
-        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(bridged)
-        in_h = px.y2 - px.y1
-        keep = np.zeros_like(salient)
-        for lbl in range(1, num_labels):
-            comp = labels == lbl
-            if not np.any(comp[:in_h, :]):
-                continue
-            pts = (salient > 0) & comp
-            _, cxs = np.where(pts)
-            if cxs.size == 0 or int(cxs.min()) <= 2 or int(cxs.max()) >= search.shape[1] - 3:
-                continue
-            keep[pts] = 1
-
-        ys, xs = np.where(keep > 0)
-        if xs.size < 20:
-            return padded
-        gy1, gy2 = (sy1 + int(ys.min())) / float(h), (sy1 + int(ys.max())) / float(h)
-        if gy2 <= padded.y_max - 0.005:
-            return padded
-        gx1, gx2 = (px.x1 + int(xs.min())) / float(w), (px.x1 + int(xs.max())) / float(w)
-        nx1 = max(0.0, min(padded.x_min, gx1 - 0.025))
-        ny1 = min(padded.y_max - 0.02, max(0.0, max(padded.y_min, gy1 - 0.035)))
-        nx2 = min(1.0, max(padded.x_max, gx2 + 0.025))
-        ny2 = min(1.0, max(padded.y_max, gy2 + 0.025))
-        if nx2 - nx1 < 0.02 or ny2 - ny1 < 0.02:
-            return padded
-        return NormalizedBox(round(nx1, 4), round(ny1, 4), round(nx2, 4), round(ny2, 4))
-
-    @classmethod
+    @staticmethod
     def _segment_garment_bounds(
-        cls, model_rgb: NDArray[np.uint8], ref_rgb: NDArray[np.uint8]
+        model_rgb: NDArray[np.uint8], ref_rgb: NDArray[np.uint8]
     ) -> (
         tuple[
             tuple[float, float, float, float],
@@ -747,47 +602,7 @@ class Qwen3VLInspector:
         ]
         | None
     ):
-        """Segment matching garment silhouette bounds between Product Reference and On-Model."""
-        h, w = model_rgb.shape[:2]
-        rh, rw = ref_rgb.shape[:2]
-        if h < 32 or w < 32 or rh < 32 or rw < 32:
-            return None
-
-        rbg = cls._sample_studio_bg_rgb(ref_rgb)
-        rm = np.linalg.norm(ref_rgb.astype(np.float32) - rbg.reshape(1, 1, 3), axis=2) > 24.0
-        if int(np.count_nonzero(rm)) < 100:
-            return None
-        ry_idx, rx_idx = np.where(rm.sum(axis=1) >= 20)[0], np.where(rm.sum(axis=0) >= 20)[0]
-        if ry_idx.size < 10 or rx_idx.size < 10:
-            return None
-        ref_bounds = (
-            int(rx_idx[0]) / float(rw),
-            int(ry_idx[0]) / float(rh),
-            int(rx_idx[-1]) / float(rw),
-            int(ry_idx[-1]) / float(rh),
-        )
-        ref_cloth = np.median(ref_rgb[rm].astype(np.float32), axis=0)
-
-        mbg = cls._sample_studio_bg_rgb(model_rgb)
-        m_f = model_rgb.astype(np.float32)
-        c_rg, c_gb = float(ref_cloth[0] - ref_cloth[1]), float(ref_cloth[1] - ref_cloth[2])
-        m_chroma = np.hypot(
-            (m_f[:, :, 0] - m_f[:, :, 1]) - c_rg, (m_f[:, :, 1] - m_f[:, :, 2]) - c_gb
-        )
-        diff_c = np.linalg.norm(m_f - ref_cloth.reshape(1, 1, 3), axis=2)
-        diff_mbg = np.linalg.norm(m_f - mbg.reshape(1, 1, 3), axis=2)
-        mm_raw = ((diff_mbg > 18.0) & (diff_c < 52.0) & (m_chroma < 14.0)).astype(np.uint8)
-        mm = cv2.morphologyEx(mm_raw, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
-        my_idx, mx_idx = np.where(mm.sum(axis=1) >= 30)[0], np.where(mm.sum(axis=0) >= 30)[0]
-        if my_idx.size < 10 or mx_idx.size < 10:
-            return None
-        model_bounds = (
-            int(mx_idx[0]) / float(w),
-            int(my_idx[0]) / float(h),
-            int(mx_idx[-1]) / float(w),
-            int(my_idx[-1]) / float(h),
-        )
-        return ref_bounds, model_bounds, rbg, ref_cloth, np.asarray(mm, dtype=np.uint8)
+        return segment_garment_bounds(model_rgb, ref_rgb)
 
     @staticmethod
     def _find_salient_ref_bounds(
@@ -796,217 +611,22 @@ class Qwen3VLInspector:
         rbg: NDArray[np.float32],
         ref_cloth: NDArray[np.float32],
     ) -> tuple[float, float, float, float]:
-        """Locate tight chromatic/high-contrast graphic bounds inside reference detail crop."""
-        rh, rw = ref_rgb.shape[:2]
-        rpx = ref_box.to_pixel_bbox(rw, rh)
-        rp = ref_rgb[rpx.y1 : rpx.y2, rpx.x1 : rpx.x2].astype(np.float32)
-        c_rg, c_gb = float(ref_cloth[0] - ref_cloth[1]), float(ref_cloth[1] - ref_cloth[2])
-        r_chroma = np.hypot((rp[:, :, 0] - rp[:, :, 1]) - c_rg, (rp[:, :, 1] - rp[:, :, 2]) - c_gb)
-        r_cloth_dist = np.linalg.norm(rp - ref_cloth.reshape(1, 1, 3), axis=2)
-        r_bg_dist = np.linalg.norm(rp - rbg.reshape(1, 1, 3), axis=2)
-        chroma_sal = (r_chroma > 16.0) & (r_bg_dist > 28.0)
-        sal = (
-            chroma_sal
-            if int(np.count_nonzero(chroma_sal)) >= 40
-            else ((r_cloth_dist > 44.0) & (r_bg_dist > 28.0))
-        )
-        rys, rxs = np.where(sal)
-        if rxs.size < 20 or rys.size < 20:
-            return ref_box.x_min, ref_box.y_min, ref_box.x_max, ref_box.y_max
-        return (
-            (rpx.x1 + int(rxs.min())) / float(rw),
-            (rpx.y1 + int(rys.min())) / float(rh),
-            (rpx.x1 + int(rxs.max())) / float(rw),
-            (rpx.y1 + int(rys.max())) / float(rh),
-        )
+        return find_salient_ref_bounds(ref_rgb, ref_box, rbg, ref_cloth)
 
-    @classmethod
+    @staticmethod
     def _split_misplaced_defect_if_shifted(
-        cls,
         model_rgb: NDArray[np.uint8],
         ref_rgb: NDArray[np.uint8],
         defects: list[DefectTarget],
+        heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
     ) -> list[DefectTarget]:
-        """Split a misplaced lower/upper logo defect into separate ERASE + INSERT targets."""
-        defect = defects[0]
-        seg = cls._segment_garment_bounds(model_rgb, ref_rgb)
-        if seg is None:
-            return defects
-        ref_bounds, model_bounds, rbg, ref_cloth, mm = seg
-        rx1, ry1, rx2, ry2 = ref_bounds
-        mx1, my1, mx2, my2 = model_bounds
+        return split_misplaced_defect_if_shifted(model_rgb, ref_rgb, defects, heuristics=heuristics)
 
-        m_box, r_box = defect.model_target_box, defect.reference_detail_box
-        true_rx1, true_ry1, true_rx2, true_ry2 = cls._find_salient_ref_bounds(
-            ref_rgb, r_box, rbg, ref_cloth
-        )
-        m_cx_raw = 0.5 * (m_box.x_min + m_box.x_max)
-        r_cx = 0.5 * (true_rx1 + true_rx2)
-        rel_rx = (r_cx - rx1) / max(0.1, rx2 - rx1)
-        expected_mcx = mx1 + rel_rx * (mx2 - mx1)
-
-        m_cy = 0.5 * (m_box.y_min + m_box.y_max)
-        r_cy = 0.5 * (true_ry1 + true_ry2)
-        rel_ry = (r_cy - ry1) / max(0.1, ry2 - ry1)
-        expected_mcy = my1 + rel_ry * (my2 - my1)
-
-        y_shifted = abs(m_cy - r_cy) > 0.25 and abs(m_cy - expected_mcy) > 0.04
-        x_shifted = abs(m_cx_raw - r_cx) > 0.22 and abs(m_cx_raw - expected_mcx) > 0.12
-        if not y_shifted and not x_shifted:
-            return defects
-
-        h, w = model_rgb.shape[:2]
-        mpx = m_box.to_pixel_bbox(w, h)
-        mp = model_rgb[mpx.y1 : mpx.y2, mpx.x1 : mpx.x2].astype(np.float32)
-        c_rg, c_gb = float(ref_cloth[0] - ref_cloth[1]), float(ref_cloth[1] - ref_cloth[2])
-        m_chroma = np.hypot((mp[:, :, 0] - mp[:, :, 1]) - c_rg, (mp[:, :, 1] - mp[:, :, 2]) - c_gb)
-        m_cloth_dist = np.linalg.norm(mp - ref_cloth.reshape(1, 1, 3), axis=2)
-        mys, mxs = np.where((m_chroma > 18.0) | (m_cloth_dist > 48.0))
-        erase_box = m_box
-        if mxs.size >= 40:
-            ex1 = max(m_box.x_min + 0.012, (mpx.x1 + int(np.percentile(mxs, 2))) / w - 0.015)
-            ey1 = max(m_box.y_min, (mpx.y1 + int(np.percentile(mys, 5))) / h - 0.015)
-            ex2 = min(m_box.x_max, (mpx.x1 + int(np.percentile(mxs, 98))) / w + 0.015)
-            ey2 = min(m_box.y_max, (mpx.y1 + int(np.percentile(mys, 98))) / h + 0.015)
-            if ex2 - ex1 >= 0.03 and ey2 - ey1 >= 0.03:
-                erase_box = NormalizedBox(
-                    round(ex1, 4), round(ey1, 4), round(ex2, 4), round(ey2, 4)
-                )
-
-        ref_erase_box = NormalizedBox(
-            round(max(0.0, min(0.88, true_rx1)), 4),
-            round(max(0.0, min(0.80, m_box.y_min)), 4),
-            round(min(1.0, max(true_rx1 + 0.05, min(0.95, true_rx1 + 0.10))), 4),
-            round(min(1.0, max(min(0.80, m_box.y_min) + 0.05, min(0.92, m_box.y_max))), 4),
-        )
-        erase_target = DefectTarget(
-            defect_summary="Erase misplaced graphic from wrong garment zone",
-            model_target_box=erase_box,
-            reference_detail_box=ref_erase_box,
-            edit_prompt=(
-                "Edit <image1>: Remove and erase the misplaced logo patch completely, "
-                "leaving clean seamless plain garment fabric matching <image2>."
-            ),
-        )
-
-        ins_w = min(
-            0.074, max(0.060, (true_rx2 - true_rx1) * (mx2 - mx1) / max(0.1, rx2 - rx1) + 0.026)
-        )
-        ins_h = min(
-            0.076, max(0.068, (true_ry2 - true_ry1) * (my2 - my1) / max(0.1, ry2 - ry1) + 0.030)
-        )
-        if not y_shifted:
-            target_cy = max(my1 + 0.10 * (my2 - my1), min(my2 - 0.10 * (my2 - my1), expected_mcy))
-        elif m_cy > expected_mcy:
-            min_allowed_cy = my1 + 0.15 * (my2 - my1)
-            clear_above_cy = max(min_allowed_cy, erase_box.y_min - 0.5 * ins_h - 0.004)
-            target_cy = min(expected_mcy, clear_above_cy)
-        else:
-            max_allowed_cy = my2 - 0.15 * (my2 - my1)
-            clear_below_cy = min(max_allowed_cy, erase_box.y_max + 0.5 * ins_h + 0.004)
-            target_cy = max(expected_mcy, clear_below_cy)
-
-        iy1 = max(0.0, min(1.0 - ins_h, target_cy - 0.5 * ins_h))
-        iy2 = min(1.0, iy1 + ins_h)
-        if x_shifted:
-            ix1 = max(mx1 + 0.02, min(mx2 - ins_w - 0.02, expected_mcx - 0.5 * ins_w))
-        else:
-            m_cx = 0.5 * (erase_box.x_min + erase_box.x_max)
-            ix1 = max(m_box.x_min + 0.025, m_cx - 0.5 * ins_w)
-            y_band = mm[int(iy1 * h) : max(int(iy1 * h) + 1, int(iy2 * h)), :]
-            cloth_cols = np.where(y_band.mean(axis=0) > 0.5)[0]
-            half_mid = 0.5 * (mx1 + mx2) * w
-            side_cols = (
-                cloth_cols[cloth_cols < half_mid]
-                if m_cx * w < half_mid
-                else cloth_cols[cloth_cols >= half_mid]
-            )
-            if side_cols.size >= 10:
-                edge_x = int(side_cols[0]) / float(w)
-                ix1 = max(ix1, min(int(side_cols[-1]) / float(w) - ins_w, edge_x - 0.025))
-        ix1 = max(0.0, min(1.0 - ins_w, ix1))
-        ix2 = min(1.0, ix1 + ins_w)
-
-        tight_ref_box = NormalizedBox(
-            round(max(0.0, true_rx1 - 0.015), 4),
-            round(max(0.0, true_ry1 - 0.015), 4),
-            round(min(1.0, true_rx2 + 0.015), 4),
-            round(min(1.0, true_ry2 + 0.015), 4),
-        )
-        insert_target = DefectTarget(
-            defect_summary="Insert authentic logo detail at aligned garment zone",
-            model_target_box=NormalizedBox(
-                round(ix1, 4), round(iy1, 4), round(ix2, 4), round(iy2, 4)
-            ),
-            reference_detail_box=tight_ref_box,
-            edit_prompt=(
-                "Edit <image1>: Add ONLY the authentic small detail from Image 2 onto this spot, "
-                "matching <image2> in size and design."
-            ),
-        )
-        return [erase_target, insert_target]
-
-    @classmethod
+    @staticmethod
     def _find_salient_emblem_box(
-        cls, image_rgb: NDArray[np.uint8], hint_box: NormalizedBox
+        image_rgb: NDArray[np.uint8], hint_box: NormalizedBox
     ) -> NormalizedBox | None:
-        """Locate a compact high-contrast chest emblem inside the garment zone."""
-        h, w = image_rgb.shape[:2]
-        if h < 32 or w < 32:
-            return None
-        bg_med = cls._sample_studio_bg_rgb(image_rgb)
-        px = hint_box.to_pixel_bbox(w, h)
-        sx1, sx2 = max(0, px.x1 - int(0.06 * w)), min(w, px.x2 + int(0.06 * w))
-        sy1, sy2 = max(0, px.y1 - int(0.06 * h)), min(h, px.y2 + int(0.06 * h))
-        patch = image_rgb[sy1:sy2, sx1:sx2].astype(np.float32)
-        if patch.shape[0] < 16 or patch.shape[1] < 16:
-            return None
-
-        fg_mask = np.linalg.norm(patch - bg_med.reshape(1, 1, 3), axis=2) > 28.0
-        if int(np.count_nonzero(fg_mask)) < 100:
-            return None
-        cloth_med = np.median(patch[fg_mask], axis=0)
-        diff = np.linalg.norm(patch - cloth_med.reshape(1, 1, 3), axis=2)
-        thr = max(75.0, float(np.percentile(diff[fg_mask], 98.5)))
-        salient = ((diff >= thr) & fg_mask).astype(np.uint8)
-
-        k = max(3, int(round(min(h, w) * 0.005)))
-        bridged = cv2.dilate(salient, np.ones((k, k), np.uint8))
-        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(bridged)
-
-        best_box: NormalizedBox | None = None
-        best_score = -1.0
-        ph, pw = patch.shape[:2]
-        max_pts = int(0.12 * ph * pw)
-        for lbl in range(1, num_labels):
-            pts = (salient > 0) & (labels == lbl)
-            count = int(np.count_nonzero(pts))
-            if count < 15 or count > max_pts:
-                continue
-            ys, xs = np.where(pts)
-            if (
-                int(xs.min()) <= 2
-                or int(ys.min()) <= 2
-                or int(xs.max()) >= pw - 3
-                or int(ys.max()) >= ph - 3
-            ):
-                continue
-            bw, bh = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
-            if max(bw / max(1.0, float(bh)), bh / max(1.0, float(bw))) > 3.0:
-                continue
-            score = float(count) * float(diff[pts].mean())
-            if score > best_score:
-                best_score = score
-                nx1, ny1 = (sx1 + int(xs.min())) / float(w), (sy1 + int(ys.min())) / float(h)
-                nx2, ny2 = (sx1 + int(xs.max())) / float(w), (sy1 + int(ys.max())) / float(h)
-                if nx2 - nx1 >= 0.02 or ny2 - ny1 >= 0.02:
-                    best_box = NormalizedBox(
-                        round(max(0.0, nx1), 4),
-                        round(max(0.0, ny1), 4),
-                        round(min(1.0, max(nx1 + 0.02, nx2)), 4),
-                        round(min(1.0, max(ny1 + 0.02, ny2)), 4),
-                    )
-        return best_box
+        return find_salient_emblem_box(image_rgb, hint_box)
 
     @staticmethod
     def _emblem_pattern_correlation(
@@ -1015,95 +635,28 @@ class Qwen3VLInspector:
         ref_rgb: NDArray[np.uint8],
         r_box: NormalizedBox,
     ) -> float:
-        """Return normalized 64x64 contrast-map correlation between two small emblems."""
+        return emblem_pattern_correlation(model_rgb, m_box, ref_rgb, r_box)
 
-        def _norm_patch(img: NDArray[np.uint8], box: NormalizedBox) -> NDArray[np.float32]:
-            h, w = img.shape[:2]
-            px = box.to_pixel_bbox(w, h)
-            pad = 3
-            crop = img[
-                max(0, px.y1 - pad) : min(h, px.y2 + pad),
-                max(0, px.x1 - pad) : min(w, px.x2 + pad),
-            ].astype(np.float32)
-            cloth = np.median(crop.reshape(-1, 3), axis=0)
-            dist = np.linalg.norm(crop - cloth.reshape(1, 1, 3), axis=2)
-            norm = (dist - float(dist.min())) / max(1.0, float(dist.max() - dist.min()))
-            return np.asarray(
-                cv2.resize(norm.astype(np.float32), (64, 64), interpolation=cv2.INTER_LINEAR),
-                dtype=np.float32,
-            )
-
-        pm = _norm_patch(model_rgb, m_box)
-        pr = _norm_patch(ref_rgb, r_box)
-        if float(np.std(pm)) < 1e-4 or float(np.std(pr)) < 1e-4:
-            return 1.0
-        return float(np.corrcoef(pm.ravel(), pr.ravel())[0, 1])
-
-    @classmethod
+    @staticmethod
     def _detect_micro_emblem_defect(
-        cls,
         model_rgb: NDArray[np.uint8],
         ref_rgb: NDArray[np.uint8],
         source_label: str,
+        heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
     ) -> VLMInspectionResult | None:
-        """Fallback localizer catching small emblem mismatches across general garment zones."""
-        candidate_zones = (
-            NormalizedBox(0.50, 0.26, 0.68, 0.46),  # right chest (viewer perspective)
-            NormalizedBox(0.32, 0.26, 0.50, 0.46),  # left chest (viewer perspective)
-            NormalizedBox(0.41, 0.22, 0.59, 0.44),  # center chest / upper back
-            NormalizedBox(0.28, 0.22, 0.48, 0.44),  # upper left hip / thigh
-            NormalizedBox(0.52, 0.22, 0.72, 0.44),  # upper right hip / thigh
-        )
-        best_match: tuple[float, NormalizedBox, NormalizedBox] | None = None
-        for zone in candidate_zones:
-            m_emblem = cls._find_salient_emblem_box(model_rgb, zone)
-            r_emblem = cls._find_salient_emblem_box(ref_rgb, zone)
-            if m_emblem is None or r_emblem is None:
-                continue
-            corr = cls._emblem_pattern_correlation(model_rgb, m_emblem, ref_rgb, r_emblem)
-            if corr < 0.75:
-                best_match = (corr, m_emblem, r_emblem)
-                break
-
-        if best_match is None:
+        res = detect_micro_emblem_defect(model_rgb, ref_rgb, source_label, heuristics=heuristics)
+        if res is None:
             return None
-        corr, m_emblem, r_emblem = best_match
-
-        m_w = m_emblem.x_max - m_emblem.x_min
-        m_h = m_emblem.y_max - m_emblem.y_min
-        r_w = r_emblem.x_max - r_emblem.x_min
-        r_h = r_emblem.y_max - r_emblem.y_min
-        box_w = max(m_w, r_w * 0.78) + 0.020
-        box_h = max(m_h, r_h * 0.78) + 0.020
-        m_cx = 0.5 * (m_emblem.x_min + m_emblem.x_max)
-        m_cy = 0.5 * (m_emblem.y_min + m_emblem.y_max)
-
-        model_box = NormalizedBox(
-            round(max(0.0, m_cx - 0.5 * box_w), 4),
-            round(max(0.0, m_cy - 0.5 * box_h), 4),
-            round(min(1.0, m_cx + 0.5 * box_w), 4),
-            round(min(1.0, m_cy + 0.5 * box_h), 4),
-        )
-        ref_box = NormalizedBox(
-            round(max(0.0, r_emblem.x_min - 0.012), 4),
-            round(max(0.0, r_emblem.y_min - 0.012), 4),
-            round(min(1.0, r_emblem.x_max + 0.012), 4),
-            round(min(1.0, r_emblem.y_max + 0.012), 4),
-        )
-        prompt = (
-            "Edit <image1>: Replace the defective chest logo with ONLY the exact authentic logo "
-            "from <image2>, restoring all leaves, internal cutout stripes, and text to match "
-            "<image2> in position and size."
-        )
+        summary, model_box, ref_box, prompt = res
         defect = DefectTarget(
-            defect_summary=f"Small chest emblem structural mismatch detected (corr={corr:.2f})",
+            defect_summary=summary,
             model_target_box=model_box,
             reference_detail_box=ref_box,
             edit_prompt=prompt,
         )
         return VLMInspectionResult(
             has_defect=True,
-            defect_summary=defect.defect_summary,
+            defect_summary=summary,
             model_target_box=model_box,
             reference_detail_box=ref_box,
             edit_prompt=prompt,

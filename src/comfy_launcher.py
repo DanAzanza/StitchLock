@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -19,6 +20,8 @@ from urllib.parse import urlparse
 import requests
 
 from src.models import ComfyConfig, ComfyExecutionError
+
+LOGGER = logging.getLogger("garment_fix.launcher")
 
 
 @dataclass(frozen=True)
@@ -394,7 +397,7 @@ def ensure_comfyui_server(config: ComfyConfig, startup_timeout: float = 90.0) ->
     host = parsed.hostname or "127.0.0.1"
     port = str(parsed.port or 8000)
 
-    print(f"[AUTO-START] Launching ComfyUI ({instance.name}) on {target_url}...")
+    LOGGER.info("Auto-starting ComfyUI (%s) on %s...", instance.name, target_url)
     proc = _spawn_instance(instance, host, port)
     _SPAWNED_PROCESS = proc
     _SPAWNED_SERVER_URL = target_url
@@ -405,7 +408,7 @@ def ensure_comfyui_server(config: ComfyConfig, startup_timeout: float = 90.0) ->
     deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
         if is_comfy_server_online(target_url, timeout=1.5):
-            print(f"[OK] ComfyUI server is online at {target_url}.")
+            LOGGER.info("ComfyUI server is online at %s.", target_url)
             return target_url
         if proc.poll() is not None and instance.mode == "headless":
             raise ComfyExecutionError(

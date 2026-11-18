@@ -1,4 +1,4 @@
-"""Stage 2: ComfyUI Qwen-Image 2.1 Headless API Bridge."""
+"""Stage 2: ComfyUI Qwen-Image 2.1 Headless API Bridge & Shared Transport Helpers."""
 
 from __future__ import annotations
 
@@ -19,6 +19,146 @@ from PIL import Image
 
 from src.comfy_launcher import ensure_comfyui_server, probe_candidate_servers
 from src.models import ComfyConfig, ComfyExecutionError
+
+_TRANSPORT_ERRORS = (
+    requests.RequestException,
+    websocket.WebSocketException,
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+    OSError,
+)
+
+
+def encode_png_rgb(image_rgb: NDArray[np.uint8]) -> bytes:
+    """Encode a 3-channel uint8 RGB image array as lossless PNG bytes."""
+    buf = io.BytesIO()
+    Image.fromarray(image_rgb, mode="RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def encode_png_greyscale(mask_grey: NDArray[np.uint8]) -> bytes:
+    """Encode a single-channel 2D uint8 mask array as PNG bytes."""
+    buf = io.BytesIO()
+    Image.fromarray(mask_grey, mode="L").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def build_ws_url(server_url: str, client_id: str) -> str:
+    """Build the ComfyUI WebSocket endpoint URL for a given client ID."""
+    parsed = urlparse(server_url)
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    return f"{ws_scheme}://{parsed.netloc}/ws?clientId={client_id}"
+
+
+def upload_png_bytes(server_url: str, filename: str, png_bytes: bytes) -> str:
+    """Upload PNG bytes to ComfyUI /upload/image and return the server-assigned filename."""
+    try:
+        resp = requests.post(
+            f"{server_url}/upload/image",
+            files={"image": (filename, png_bytes, "image/png")},
+            data={"overwrite": "true"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return str(payload["name"])
+    except _TRANSPORT_ERRORS as exc:
+        raise ComfyExecutionError(f"Failed to upload '{filename}' to ComfyUI: {exc}") from exc
+
+
+def queue_prompt(server_url: str, workflow: dict[str, Any], client_id: str) -> str:
+    """Submit a prepared API workflow graph to ComfyUI /prompt and return prompt_id."""
+    try:
+        resp = requests.post(
+            f"{server_url}/prompt",
+            json={"prompt": workflow, "client_id": client_id},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return str(payload["prompt_id"])
+    except _TRANSPORT_ERRORS as exc:
+        raise ComfyExecutionError(f"Failed to queue prompt on ComfyUI: {exc}") from exc
+
+
+def wait_for_prompt_completion(ws: websocket.WebSocket, prompt_id: str, timeout_s: float) -> None:
+    """Wait on an open ComfyUI WebSocket until prompt_id finishes or raises an error."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            raw_msg = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            continue
+        except _TRANSPORT_ERRORS as exc:
+            raise ComfyExecutionError(f"WebSocket error during execution: {exc}") from exc
+
+        if not isinstance(raw_msg, str):
+            continue
+
+        try:
+            event = json.loads(raw_msg)
+        except json.JSONDecodeError:
+            continue
+        msg_type = event.get("type")
+        data = event.get("data", {})
+        if data.get("prompt_id") != prompt_id:
+            continue
+
+        if msg_type == "execution_error":
+            err_msg = data.get("exception_message", "Unknown ComfyUI execution error")
+            raise ComfyExecutionError(f"ComfyUI node execution failed: {err_msg}")
+
+        if msg_type == "executing" and data.get("node") is None:
+            return
+
+    raise ComfyExecutionError(
+        f"ComfyUI execution timed out after {timeout_s:.1f}s for prompt_id={prompt_id}."
+    )
+
+
+def fetch_prompt_history(server_url: str, prompt_id: str) -> dict[str, Any]:
+    """Fetch ComfyUI /history/<prompt_id> outputs mapping."""
+    try:
+        hist_resp = requests.get(f"{server_url}/history/{prompt_id}", timeout=15.0)
+        hist_resp.raise_for_status()
+        history: dict[str, Any] = hist_resp.json().get(prompt_id, {})
+        outputs: dict[str, Any] = history.get("outputs", {})
+        return outputs
+    except _TRANSPORT_ERRORS as exc:
+        raise ComfyExecutionError(
+            f"Failed to retrieve execution history for prompt_id={prompt_id}: {exc}"
+        ) from exc
+
+
+def execute_comfy_prompt(
+    server_url: str,
+    workflow: dict[str, Any],
+    timeout_s: float,
+    case_id: str,
+) -> dict[str, Any]:
+    """Subscribe to ComfyUI WebSocket, submit workflow, wait for completion, and return outputs."""
+    client_id = str(uuid.uuid4())
+    ws_url = build_ws_url(server_url, client_id)
+
+    ws = websocket.WebSocket()
+    ws.settimeout(5.0)
+    try:
+        ws.connect(ws_url)
+    except _TRANSPORT_ERRORS as exc:
+        raise ComfyExecutionError(f"Failed to connect WebSocket to {ws_url}: {exc}") from exc
+
+    try:
+        prompt_id = queue_prompt(server_url, workflow, client_id)
+        wait_for_prompt_completion(ws, prompt_id, timeout_s)
+    except ComfyExecutionError:
+        raise
+    except _TRANSPORT_ERRORS as exc:
+        raise ComfyExecutionError(f"ComfyUI execution failed for case '{case_id}': {exc}") from exc
+    finally:
+        ws.close()
+
+    return fetch_prompt_history(server_url, prompt_id)
 
 
 class ComfyQwenBridge:
@@ -42,6 +182,19 @@ class ComfyQwenBridge:
             )
         return data
 
+    def probe_live_server(self) -> str | None:
+        """Public wrapper probing configured ComfyUI ports (auto-launching if enabled)."""
+        return self._probe_live_server()
+
+    def _probe_live_server(self) -> str | None:
+        """Probe configured ComfyUI ports and auto-launch backend when configured."""
+        active = probe_candidate_servers(self._config)
+        if active is not None:
+            return active
+        if self._config.auto_launch:
+            return ensure_comfyui_server(self._config)
+        return None
+
     def restore_detail_roi(
         self,
         cropped_model_roi: NDArray[np.uint8],
@@ -53,9 +206,6 @@ class ComfyQwenBridge:
         """Restore the garment detail ROI via live ComfyUI Qwen-Image 2.1 Edit.
 
         Fails fast with ComfyExecutionError if the ComfyUI server is offline or fails.
-
-        Returns:
-            Tuple of (restored_roi_rgb_1024x1024, backend_identifier).
         """
         self._validate_inputs(cropped_model_roi, cropped_product_ref, cropped_mask_greyscale)
 
@@ -99,41 +249,6 @@ class ComfyQwenBridge:
                 f"Model ROI {model_roi.shape[:2]} and greyscale mask {mask_grey.shape[:2]} "
                 "dimensions must match."
             )
-
-    def _probe_live_server(self) -> str | None:
-        """Probe configured ComfyUI ports and auto-launch backend when configured."""
-        active = probe_candidate_servers(self._config)
-        if active is not None:
-            return active
-        if self._config.auto_launch:
-            return ensure_comfyui_server(self._config)
-        return None
-
-    def get_registered_node_types(self, server_url: str | None = None) -> set[str] | None:
-        """Query ComfyUI /object_info to verify registered custom nodes (fail-closed pre-flight)."""
-        base = (server_url or self._config.server_url).rstrip("/")
-        try:
-            resp = requests.get(f"{base}/object_info", timeout=5.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    return set(data.keys())
-        except (requests.RequestException, ValueError, OSError):
-            return None
-        return None
-
-    def free_memory(self, unload_models: bool = False, server_url: str | None = None) -> bool:
-        """Trigger CUDA VRAM reclamation on ComfyUI (/free) on OOM recovery or teardown."""
-        base = (server_url or self._config.server_url).rstrip("/")
-        try:
-            resp = requests.post(
-                f"{base}/free",
-                json={"unload_models": unload_models, "free_memory": True},
-                timeout=5.0,
-            )
-            return resp.status_code == 200
-        except (requests.RequestException, OSError):
-            return False
 
     def build_workflow_payload(
         self,
@@ -181,17 +296,17 @@ class ComfyQwenBridge:
         case_id: str,
     ) -> NDArray[np.uint8]:
         """Execute pure Qwen-Image 2.1 Edit on full On-Model, full Product Ref, and mask."""
-        model_png = self._encode_png_rgb(cropped_model_roi)
-        ref_png = self._encode_png_rgb(cropped_product_ref)
-        mask_png = self._encode_png_greyscale(cropped_mask_greyscale)
         run_token = uuid.uuid4().hex[:8]
-
-        model_server_name = self._upload_image(
-            server_url, f"roi_{case_id}_{run_token}.png", model_png
+        model_server_name = upload_png_bytes(
+            server_url, f"roi_{case_id}_{run_token}.png", encode_png_rgb(cropped_model_roi)
         )
-        ref_server_name = self._upload_image(server_url, f"ref_{case_id}_{run_token}.png", ref_png)
-        mask_server_name = self._upload_image(
-            server_url, f"mask_{case_id}_{run_token}.png", mask_png
+        ref_server_name = upload_png_bytes(
+            server_url, f"ref_{case_id}_{run_token}.png", encode_png_rgb(cropped_product_ref)
+        )
+        mask_server_name = upload_png_bytes(
+            server_url,
+            f"mask_{case_id}_{run_token}.png",
+            encode_png_greyscale(cropped_mask_greyscale),
         )
 
         workflow = self.build_workflow_payload(
@@ -201,117 +316,27 @@ class ComfyQwenBridge:
             prompt=prompt,
             output_prefix=f"garment_fix_{case_id}",
         )
-
-        client_id = str(uuid.uuid4())
-        ws_url = self._build_ws_url(server_url, client_id)
-
-        ws = websocket.WebSocket()
-        ws.settimeout(5.0)
-        try:
-            ws.connect(ws_url)
-        except Exception as exc:
-            raise ComfyExecutionError(f"Failed to connect WebSocket to {ws_url}: {exc}") from exc
-
-        try:
-            prompt_id = self._queue_prompt(server_url, workflow, client_id)
-            self._wait_for_completion(ws, prompt_id, self._config.timeout_seconds)
-        finally:
-            ws.close()
-
-        return self._fetch_output_image(
+        outputs = execute_comfy_prompt(
             server_url=server_url,
-            prompt_id=prompt_id,
+            workflow=workflow,
+            timeout_s=self._config.timeout_seconds,
+            case_id=case_id,
+        )
+        return self._download_output_image(
+            server_url=server_url,
+            outputs=outputs,
             target_size=(cropped_model_roi.shape[1], cropped_model_roi.shape[0]),
+            case_id=case_id,
         )
 
     @staticmethod
-    def _build_ws_url(server_url: str, client_id: str) -> str:
-        parsed = urlparse(server_url)
-        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
-        return f"{ws_scheme}://{parsed.netloc}/ws?clientId={client_id}"
-
-    @staticmethod
-    def _encode_png_rgb(image_rgb: NDArray[np.uint8]) -> bytes:
-        buf = io.BytesIO()
-        Image.fromarray(image_rgb, mode="RGB").save(buf, format="PNG")
-        return buf.getvalue()
-
-    @staticmethod
-    def _encode_png_greyscale(mask_grey: NDArray[np.uint8]) -> bytes:
-        buf = io.BytesIO()
-        Image.fromarray(mask_grey, mode="L").save(buf, format="PNG")
-        return buf.getvalue()
-
-    @staticmethod
-    def _upload_image(server_url: str, filename: str, png_bytes: bytes) -> str:
-        try:
-            resp = requests.post(
-                f"{server_url}/upload/image",
-                files={"image": (filename, png_bytes, "image/png")},
-                data={"overwrite": "true"},
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            return str(payload["name"])
-        except Exception as exc:
-            raise ComfyExecutionError(f"Failed to upload '{filename}' to ComfyUI: {exc}") from exc
-
-    @staticmethod
-    def _queue_prompt(server_url: str, workflow: dict[str, Any], client_id: str) -> str:
-        try:
-            resp = requests.post(
-                f"{server_url}/prompt",
-                json={"prompt": workflow, "client_id": client_id},
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            return str(payload["prompt_id"])
-        except Exception as exc:
-            raise ComfyExecutionError(f"Failed to queue prompt on ComfyUI: {exc}") from exc
-
-    @staticmethod
-    def _wait_for_completion(ws: websocket.WebSocket, prompt_id: str, timeout_s: float) -> None:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            try:
-                raw_msg = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                continue
-            except Exception as exc:
-                raise ComfyExecutionError(f"WebSocket error during execution: {exc}") from exc
-
-            if not isinstance(raw_msg, str):
-                continue
-
-            event = json.loads(raw_msg)
-            msg_type = event.get("type")
-            data = event.get("data", {})
-            if data.get("prompt_id") != prompt_id:
-                continue
-
-            if msg_type == "execution_error":
-                err_msg = data.get("exception_message", "Unknown ComfyUI execution error")
-                raise ComfyExecutionError(f"ComfyUI node execution failed: {err_msg}")
-
-            if msg_type == "executing" and data.get("node") is None:
-                return
-
-        raise ComfyExecutionError(
-            f"ComfyUI execution timed out after {timeout_s:.1f}s for prompt_id={prompt_id}."
-        )
-
-    @staticmethod
-    def _fetch_output_image(
-        server_url: str, prompt_id: str, target_size: tuple[int, int]
+    def _download_output_image(
+        server_url: str,
+        outputs: dict[str, Any],
+        target_size: tuple[int, int],
+        case_id: str,
     ) -> NDArray[np.uint8]:
         try:
-            hist_resp = requests.get(f"{server_url}/history/{prompt_id}", timeout=15.0)
-            hist_resp.raise_for_status()
-            history = hist_resp.json().get(prompt_id, {})
-            outputs = history.get("outputs", {})
-
             for node_output in outputs.values():
                 images = node_output.get("images", [])
                 if not images:
@@ -331,9 +356,9 @@ class ComfyQwenBridge:
                 if pil_img.size != target_size:
                     pil_img = pil_img.resize(target_size, Image.Resampling.LANCZOS)
                 return np.asarray(pil_img, dtype=np.uint8)
-        except Exception as exc:
+        except _TRANSPORT_ERRORS as exc:
             raise ComfyExecutionError(
-                f"Failed to retrieve output image for prompt_id={prompt_id}: {exc}"
+                f"Failed to retrieve output image for case '{case_id}': {exc}"
             ) from exc
 
-        raise ComfyExecutionError(f"No output images found in history for prompt_id={prompt_id}.")
+        raise ComfyExecutionError(f"No output images found in history for case '{case_id}'.")
