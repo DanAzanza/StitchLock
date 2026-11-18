@@ -60,7 +60,7 @@ All showcase cases use **100% synthetic, trademark-free studio assets** (front p
 ## 1. What I Built (Architecture & 5-Stage Pipeline)
 
 > [!NOTE]
-> For mathematical derivations of the Interior Distance-Transform Feathering, Rectified Flow Matching ODE dynamics, and Zero-Recompression PNG Provenance chunks, see [.agents/PROJECT.md](.agents/PROJECT.md).
+> For mathematical derivations of the Interior Distance-Transform Feathering, `128×128` Masked Reference Similarity, Zero-Recompression PNG Provenance chunks, and Rectified Flow Matching ODE dynamics, see [.agents/PROJECT.md](.agents/PROJECT.md) and [.agents/COMFYUI_KNOWLEDGE.md](.agents/COMFYUI_KNOWLEDGE.md).
 
 ```mermaid
 sequenceDiagram
