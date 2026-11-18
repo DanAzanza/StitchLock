@@ -16,3 +16,6 @@
   - Omit hardcoded pixel `height` (`height=None`) and combine `overflow-y: auto` with bounded thumbnail heights so scrollbars appear only when items exceed column height.
 - **Modal Pop-Ups via `gr.Group`**:
   - Gradio mirrors `elem_classes` onto nested `.gr-group` wrappers; applying `position: fixed; inset: 0` via class stacks two backdrops. Target the overlay via a unique `elem_id` scoped with `:not(.hide):not(.hidden):not([hidden])` for `display: flex`, set inner `.styler`/`.form`/`.gr-group` wrappers to `background: transparent; border: none`, and keep `overflow: hidden` on the inner card for clean rounded corners.
+- **`gr.Row(equal_height=True)` & Compact Button Rows**:
+  - `gr.Row(equal_height=True)` attaches `.stretch` (`.stretch > .column > * { flex-grow: 1; flex-shrink: 0 }`), which stretches all direct children vertically and adds wide gaps inside sidebar/workspace columns. Keep `equal_height=False` on the outer layout row, equalize column heights via CSS `align-items: stretch` on the row, and enforce `flex-grow: 0; flex-shrink: 0` on column children.
+  - `gr.Row` children default to `min-width: min(160px, 100%)` with `flex-wrap: wrap`; pass explicit small `min_width` values to compact sidebar `gr.Button`s and apply `flex-wrap: nowrap; min-width: 0` in CSS so action buttons remain side-by-side.
