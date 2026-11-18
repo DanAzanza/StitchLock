@@ -1150,3 +1150,197 @@ def test_vlm_misplaced_logo_erase_prompt_and_linux_launcher_detection(
     assert inst is not None
     assert inst.python_exe == py_file
     assert inst.main_py == comfy_dir / "main.py"
+
+
+def test_connected_box_misplaced_split_and_micro_emblem_supersampling(tmp_path: Path) -> None:
+    setup_all_test_cases(tmp_path)
+
+    # 1. Connected-graphic refinement expands downward to capture detached signature/text
+    dark_jacket = np.full((256, 256, 3), 24, dtype=np.uint8)
+    dark_jacket[146:162, 148:172] = 235  # upper emblem
+    dark_jacket[166:174, 146:174] = 235  # detached signature directly below
+    truncated_box = NormalizedBox(0.55, 0.46, 0.70, 0.625)
+    refined = Qwen3VLInspector._refine_connected_graphic_box(dark_jacket, truncated_box, None)
+    assert refined.y_max >= 0.68
+
+    # 2. Shifted single defect splits automatically into lower ERASE + upper INSERT targets
+    model_pants = np.full((256, 256, 3), 242, dtype=np.uint8)
+    model_pants[106:235, 92:166] = np.array([130, 140, 115], dtype=np.uint8)  # sage pants
+    model_pants[144:176, 98:124] = np.array([195, 95, 55], dtype=np.uint8)  # misplaced low badge
+    ref_pants = np.full((256, 256, 3), 242, dtype=np.uint8)
+    ref_pants[14:242, 74:182] = np.array([130, 140, 115], dtype=np.uint8)  # reference pants
+    ref_pants[72:88, 82:96] = np.array([195, 95, 55], dtype=np.uint8)  # upper hip badge
+
+    shifted_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Oversized lower badge instead of small hip patch",
+            "model_bbox_2d": [373, 550, 500, 700],
+            "ref_bbox_2d": [280, 220, 410, 390],
+            "edit_prompt": "Edit <image1>: Replace oversized patch with small badge from <image2>.",
+        }
+    )
+    split_res = Qwen3VLInspector.parse_vlm_json_response(shifted_json, model_pants, ref_pants)
+    assert len(split_res.resolved_defects) == 2
+    d_erase, d_insert = split_res.resolved_defects
+    assert Qwen3VLInspector._is_erase_defect(d_erase.edit_prompt) is True
+    assert Qwen3VLInspector._is_erase_defect(d_insert.edit_prompt) is False
+    assert d_erase.model_target_box.y_min >= 0.54
+    assert d_insert.model_target_box.y_max < d_erase.model_target_box.y_min + 0.02
+
+    # 3. Micro chest emblem: intact logo stays clean; broken logo triggers 4x micro-ROI crops
+    clean_jkt = np.full((512, 512, 3), 248, dtype=np.uint8)
+    clean_jkt[60:480, 100:410] = np.array([36, 46, 52], dtype=np.uint8)
+    crest_rgb = np.array([210, 212, 218], dtype=np.uint8)
+    # 3-leaf chest crest with hollow gaps at [0.58..0.62, 0.34..0.37]
+    clean_jkt[178:192, 304:310] = crest_rgb
+    clean_jkt[182:192, 297:302] = crest_rgb
+    clean_jkt[182:192, 312:317] = crest_rgb
+    ref_jkt = clean_jkt.copy()
+    no_defect_json = json.dumps({"has_defect": False, "defect_summary": "Looks ok", "defects": []})
+
+    intact_res = Qwen3VLInspector.parse_vlm_json_response(no_defect_json, clean_jkt, ref_jkt)
+    assert intact_res.has_defect is False
+
+    broken_jkt = clean_jkt.copy()
+    broken_jkt[178:192, 297:317] = crest_rgb  # filled-in cutouts instead of distinct hollow leaves
+    broken_res = Qwen3VLInspector.parse_vlm_json_response(no_defect_json, broken_jkt, ref_jkt)
+    assert broken_res.has_defect is True
+    assert "chest emblem" in broken_res.defect_summary
+
+    # Verify AutoMasker uses local 256x256 supersampled context_bbox for <= 0.056 micro-targets
+    manifest = load_case_manifest(tmp_path / "test_cases" / "case_01_kova_zip_jacket.png")
+    micro_manifest = replace(
+        manifest,
+        model_target_box=NormalizedBox(0.57, 0.33, 0.62, 0.37),
+        reference_detail_box=NormalizedBox(0.58, 0.29, 0.64, 0.34),
+    )
+    large_model = np.full((1024, 1024, 3), 40, dtype=np.uint8)
+    large_ref = np.full((1024, 1024, 3), 45, dtype=np.uint8)
+    masker = AutoMasker(MaskingConfig(strategy=MaskingStrategy.AUTO_VISION))
+    micro_loc = masker.localize_and_mask(large_model, large_ref, micro_manifest)
+    assert micro_loc.context_bbox.width == 256
+    assert micro_loc.context_bbox.height == 256
+    assert micro_loc.cropped_model_roi.shape == (256, 256, 3)
+    assert micro_loc.cropped_product_ref.shape == (256, 256, 3)
+    assert micro_loc.cropped_mask_greyscale.shape == (256, 256)
+    assert np.all(micro_loc.feathered_mask[micro_loc.binary_mask == 0] == 0.0)
+    assert np.count_nonzero(micro_loc.cropped_mask_greyscale) == np.count_nonzero(
+        micro_loc.binary_mask
+    )
+
+    # 4. Mandatory negative & boundary coverage across all new detection/masking paths
+    # 4a. Connected-box: prior_box containment, edge-touching stripe rejection, disconnected below
+    prior = NormalizedBox(0.50, 0.45, 0.72, 0.68)
+    assert (
+        Qwen3VLInspector._refine_connected_graphic_box(
+            dark_jacket, NormalizedBox(0.52, 0.47, 0.70, 0.66), prior
+        )
+        == prior
+    )
+    edge_stripe = np.full((256, 256, 3), 24, dtype=np.uint8)
+    edge_stripe[146:162, 148:172] = 235
+    edge_stripe[166:174, 134:186] = 235  # touches left/right search borders [134..186]
+    edge_refined = Qwen3VLInspector._refine_connected_graphic_box(edge_stripe, truncated_box, None)
+    assert edge_refined.y_max < 0.66
+    disconnected = np.full((256, 256, 3), 24, dtype=np.uint8)
+    disconnected[140:152, 148:172] = 235
+    disconnected[174:184, 148:172] = 235  # disconnected below truncated_box (y > 0.65)
+    disc_refined = Qwen3VLInspector._refine_connected_graphic_box(disconnected, truncated_box, None)
+    assert disc_refined.y_max < 0.66
+    tiny_img = np.full((64, 64, 3), 24, dtype=np.uint8)
+    tiny_refined = Qwen3VLInspector._refine_connected_graphic_box(
+        tiny_img, NormalizedBox(0.10, 0.10, 0.20, 0.20), None
+    )
+    assert tiny_refined.y_max <= 0.225
+
+    # 4b. Shifted-defect split: aligned target, unsegmentable <32px input, and too-high shifted logo
+    aligned_pants = ref_pants.copy()
+    aligned_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Aligned defect stays single pass",
+            "model_bbox_2d": [310, 270, 390, 360],
+            "ref_bbox_2d": [310, 270, 390, 360],
+            "edit_prompt": "Edit <image1>: Replace aligned patch with <image2>.",
+        }
+    )
+    aligned_res = Qwen3VLInspector.parse_vlm_json_response(aligned_json, aligned_pants, ref_pants)
+    assert len(aligned_res.resolved_defects) == 1
+    small_arr = np.full((16, 16, 3), 120, dtype=np.uint8)
+    assert (
+        len(
+            Qwen3VLInspector._split_misplaced_defect_if_shifted(
+                small_arr, small_arr, list(aligned_res.resolved_defects)
+            )
+        )
+        == 1
+    )
+    high_pants = np.full((256, 256, 3), 242, dtype=np.uint8)
+    high_pants[20:230, 80:176] = np.array([130, 140, 115], dtype=np.uint8)
+    high_pants[30:55, 86:106] = np.array([195, 95, 55], dtype=np.uint8)  # near top waistband
+    low_ref_pants = np.full((256, 256, 3), 242, dtype=np.uint8)
+    low_ref_pants[14:242, 74:182] = np.array([130, 140, 115], dtype=np.uint8)
+    low_ref_pants[160:182, 82:98] = np.array([195, 95, 55], dtype=np.uint8)  # lower thigh in ref
+    upward_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Upper misplaced badge",
+            "model_bbox_2d": [330, 110, 420, 220],
+            "ref_bbox_2d": [310, 610, 395, 720],
+            "edit_prompt": "Edit <image1>: Replace misplaced patch with <image2>.",
+        }
+    )
+    upward_res = Qwen3VLInspector.parse_vlm_json_response(upward_json, high_pants, low_ref_pants)
+    assert len(upward_res.resolved_defects) == 2
+    assert upward_res.resolved_defects[1].model_target_box.y_min >= 0.40
+
+    # 4c. Micro-emblem negative boundaries: elongated stripe, border-touching, one-sided, <32px
+    zipper_jkt = np.full((512, 512, 3), 248, dtype=np.uint8)
+    zipper_jkt[60:480, 100:410] = np.array([36, 46, 52], dtype=np.uint8)
+    zipper_jkt[155:210, 304:308] = crest_rgb  # aspect ratio 55/4 = 13.75 > 3.0 -> rejected
+    assert (
+        Qwen3VLInspector._find_salient_emblem_box(zipper_jkt, NormalizedBox(0.50, 0.26, 0.68, 0.46))
+        is None
+    )
+    one_sided = Qwen3VLInspector.parse_vlm_json_response(no_defect_json, zipper_jkt, ref_jkt)
+    assert one_sided.has_defect is False
+    assert (
+        Qwen3VLInspector._find_salient_emblem_box(
+            np.zeros((24, 24, 3), dtype=np.uint8), NormalizedBox(0.50, 0.26, 0.68, 0.46)
+        )
+        is None
+    )
+
+    # 4d. AutoMasker micro-ROI boundary transitions: macro, <512px, elongated 512x4096, corners
+    macro_manifest = replace(
+        manifest,
+        model_target_box=NormalizedBox(0.50, 0.30, 0.56, 0.36),
+        reference_detail_box=NormalizedBox(0.50, 0.30, 0.56, 0.36),
+    )
+    assert masker.localize_and_mask(
+        large_model, large_ref, macro_manifest
+    ).context_bbox == PixelBBox(0, 0, 1024, 1024)
+    sub512_model = np.full((511, 511, 3), 40, dtype=np.uint8)
+    assert masker.localize_and_mask(sub512_model, large_ref, micro_manifest).context_bbox == (
+        PixelBBox(0, 0, 511, 511)
+    )
+    elongated_model = np.full((512, 4096, 3), 40, dtype=np.uint8)
+    elongated_manifest = replace(
+        manifest,
+        model_target_box=NormalizedBox(0.50, 0.40, 0.555, 0.45),
+        reference_detail_box=NormalizedBox(0.50, 0.40, 0.555, 0.45),
+    )
+    elongated_loc = masker.localize_and_mask(elongated_model, large_ref, elongated_manifest)
+    assert elongated_loc.context_bbox == PixelBBox(0, 0, 4096, 512)
+    corner_manifest = replace(
+        manifest,
+        model_target_box=NormalizedBox(0.005, 0.005, 0.045, 0.045),
+        reference_detail_box=NormalizedBox(0.01, 0.01, 0.06, 0.06),
+    )
+    small_ref = np.full((200, 200, 3), 45, dtype=np.uint8)
+    corner_loc = masker.localize_and_mask(large_model, small_ref, corner_manifest)
+    assert corner_loc.context_bbox.width == 256
+    assert np.count_nonzero(corner_loc.cropped_mask_greyscale) == np.count_nonzero(
+        corner_loc.binary_mask
+    )

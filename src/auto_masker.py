@@ -246,11 +246,23 @@ class AutoMasker:
             else "manifest_roi_deterministic"
         )
 
-        context_bbox = PixelBBox(x1=0, y1=0, x2=width, y2=height)
-
         ref_dim = float(min(height, width))
-        dilation_px = max(2, int(round(ref_dim * self._config.mask_dilation_ratio)))
-        feather_sigma = max(1.5, ref_dim * self._config.feather_sigma_ratio)
+        crop_side = min(width, height, max(192, int(round(ref_dim * 0.25))))
+        micro_dilation_px = max(
+            2, int(round(ref_dim * min(self._config.mask_dilation_ratio, 0.008)))
+        )
+        is_micro_target = (
+            min(height, width) >= 512
+            and max(target_bbox.width / float(width), target_bbox.height / float(height)) <= 0.056
+            and (target_bbox.width + 2 * micro_dilation_px) <= crop_side
+            and (target_bbox.height + 2 * micro_dilation_px) <= crop_side
+        )
+        if is_micro_target:
+            dilation_px = micro_dilation_px
+            feather_sigma = max(1.5, ref_dim * min(self._config.feather_sigma_ratio, 0.003))
+        else:
+            dilation_px = max(2, int(round(ref_dim * self._config.mask_dilation_ratio)))
+            feather_sigma = max(1.5, ref_dim * self._config.feather_sigma_ratio)
 
         binary_mask, feathered_mask = self._build_masks(
             model_rgb=model_rgb,
@@ -258,15 +270,29 @@ class AutoMasker:
             dilation_px=dilation_px,
             feather_sigma=feather_sigma,
         )
+        full_mask_greyscale = np.clip(np.round(feathered_mask * 255.0), 0, 255).astype(np.uint8)
 
-        cropped_model_roi = model_rgb.copy()
-        cropped_product_ref = self._align_full_garment_reference(
-            ref_rgb=ref_rgb,
-            ref_detail_bbox=ref_detail_bbox,
-            target_bbox=target_bbox,
-            model_size=(width, height),
-        )
-        cropped_mask_greyscale = np.clip(np.round(feathered_mask * 255.0), 0, 255).astype(np.uint8)
+        if is_micro_target:
+            context_bbox, cropped_model_roi, cropped_product_ref, cropped_mask_greyscale = (
+                self._build_micro_roi_crops(
+                    model_rgb=model_rgb,
+                    ref_rgb=ref_rgb,
+                    full_mask_greyscale=full_mask_greyscale,
+                    target_bbox=target_bbox,
+                    ref_detail_bbox=ref_detail_bbox,
+                    dilation_px=dilation_px,
+                )
+            )
+        else:
+            context_bbox = PixelBBox(x1=0, y1=0, x2=width, y2=height)
+            cropped_model_roi = model_rgb.copy()
+            cropped_product_ref = self._align_full_garment_reference(
+                ref_rgb=ref_rgb,
+                ref_detail_bbox=ref_detail_bbox,
+                target_bbox=target_bbox,
+                model_size=(width, height),
+            )
+            cropped_mask_greyscale = full_mask_greyscale
 
         return LocalizationResult(
             binary_mask=binary_mask,
@@ -279,6 +305,68 @@ class AutoMasker:
             ref_detail_bbox=ref_detail_bbox,
             detection_method=detection_method,
         )
+
+    @staticmethod
+    def _build_micro_roi_crops(
+        model_rgb: NDArray[np.uint8],
+        ref_rgb: NDArray[np.uint8],
+        full_mask_greyscale: NDArray[np.uint8],
+        target_bbox: PixelBBox,
+        ref_detail_bbox: PixelBBox,
+        dilation_px: int = 8,
+    ) -> tuple[PixelBBox, NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8]]:
+        """Extract local 256x256 supersampled chest ROI crops for tiny emblem diffusion."""
+        height, width = model_rgb.shape[:2]
+        ref_h, ref_w = ref_rgb.shape[:2]
+        ref_dim = float(min(height, width))
+        crop_side = min(width, height, max(192, int(round(ref_dim * 0.25))))
+
+        m_cx = 0.5 * (target_bbox.x1 + target_bbox.x2)
+        m_cy = 0.5 * (target_bbox.y1 + target_bbox.y2)
+        bx1 = max(0, target_bbox.x1 - dilation_px)
+        bx2 = min(width, target_bbox.x2 + dilation_px)
+        by1 = max(0, target_bbox.y1 - dilation_px)
+        by2 = min(height, target_bbox.y2 + dilation_px)
+        cx1 = max(
+            0,
+            bx2 - crop_side,
+            min(width - crop_side, bx1, int(round(m_cx - 0.5 * crop_side))),
+        )
+        cy1 = max(
+            0,
+            by2 - crop_side,
+            min(height - crop_side, by1, int(round(m_cy - 0.5 * crop_side))),
+        )
+        context_bbox = PixelBBox(x1=cx1, y1=cy1, x2=cx1 + crop_side, y2=cy1 + crop_side)
+
+        cropped_model_roi = model_rgb[
+            context_bbox.y1 : context_bbox.y2, context_bbox.x1 : context_bbox.x2
+        ].copy()
+        cropped_mask_greyscale = full_mask_greyscale[
+            context_bbox.y1 : context_bbox.y2, context_bbox.x1 : context_bbox.x2
+        ].copy()
+
+        rel_x = (m_cx - cx1) / float(crop_side)
+        rel_y = (m_cy - cy1) / float(crop_side)
+        w_ratio = ref_detail_bbox.width / max(1.0, float(target_bbox.width))
+        h_ratio = ref_detail_bbox.height / max(1.0, float(target_bbox.height))
+        ref_scale = float(np.clip(0.5 * (w_ratio + h_ratio), 1.0, 1.8))
+        ref_side = min(ref_w, ref_h, max(crop_side, int(round(crop_side * ref_scale))))
+
+        r_cx = 0.5 * (ref_detail_bbox.x1 + ref_detail_bbox.x2)
+        r_cy = 0.5 * (ref_detail_bbox.y1 + ref_detail_bbox.y2)
+        rx1 = max(0, min(ref_w - ref_side, int(round(r_cx - rel_x * ref_side))))
+        ry1 = max(0, min(ref_h - ref_side, int(round(r_cy - rel_y * ref_side))))
+        ref_patch = ref_rgb[ry1 : ry1 + ref_side, rx1 : rx1 + ref_side]
+        cropped_product_ref = np.asarray(
+            cv2.resize(
+                ref_patch,
+                (context_bbox.width, context_bbox.height),
+                interpolation=cv2.INTER_LANCZOS4,
+            ),
+            dtype=np.uint8,
+        )
+        return context_bbox, cropped_model_roi, cropped_product_ref, cropped_mask_greyscale
 
     @staticmethod
     def _validate_rgb_image(image: NDArray[np.uint8], name: str) -> None:
@@ -338,7 +426,7 @@ class AutoMasker:
         target_bbox: PixelBBox,
         model_size: tuple[int, int],
     ) -> NDArray[np.uint8]:
-        """Align reference garment logo plane at native aspect ratio using edge replication."""
+        """Align and match scale of reference garment logo plane at native aspect ratio."""
         m_w, m_h = model_size
         r_h, r_w = ref_rgb.shape[:2]
 
@@ -347,9 +435,19 @@ class AutoMasker:
         r_cx = 0.5 * (ref_detail_bbox.x1 + ref_detail_bbox.x2) / float(r_w)
         r_cy = 0.5 * (ref_detail_bbox.y1 + ref_detail_bbox.y2) / float(r_h)
 
+        target_w_norm = target_bbox.width / float(m_w)
+        target_h_norm = target_bbox.height / float(m_h)
+        ref_w_norm = max(1e-6, ref_detail_bbox.width / float(r_w))
+        ref_h_norm = max(1e-6, ref_detail_bbox.height / float(r_h))
+        width_ratio = target_w_norm / ref_w_norm
+        height_ratio = target_h_norm / ref_h_norm
+        scale = 1.0
+        if 0.55 <= width_ratio <= 0.90:
+            scale = float(np.clip(0.5 * (width_ratio + height_ratio), 0.65, 1.0))
+
         dx_norm = t_cx - r_cx
         dy_norm = t_cy - r_cy
-        if abs(dx_norm) <= 0.08 and abs(dy_norm) <= 0.08:
+        if abs(dx_norm) <= 0.08 and abs(dy_norm) <= 0.08 and scale >= 0.95:
             return np.asarray(ref_rgb.copy(), dtype=np.uint8)
 
         # Sample outer top corners cleanly so background padding never smears foreground/chin pixels
@@ -364,11 +462,9 @@ class AutoMasker:
         )
         border_rgb = tuple(int(v) for v in np.median(corners, axis=0))
 
-        dx_px = int(round(dx_norm * r_w))
-        dy_px = int(round(dy_norm * r_h))
-        transform = np.asarray(
-            [[1.0, 0.0, float(dx_px)], [0.0, 1.0, float(dy_px)]], dtype=np.float32
-        )
+        tx = t_cx * r_w - scale * (r_cx * r_w)
+        ty = t_cy * r_h - scale * (r_cy * r_h)
+        transform = np.asarray([[scale, 0.0, float(tx)], [0.0, scale, float(ty)]], dtype=np.float32)
         aligned = cv2.warpAffine(
             ref_rgb,
             transform,
