@@ -117,7 +117,7 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
     selected_case_state = gr.State(value=first_case)
 
     with gr.Row(elem_classes=["stitch-main-row"], equal_height=False):
-        with gr.Column(scale=4, min_width=300, elem_classes=["stitch-sidebar"]):
+        with gr.Column(scale=4, min_width=240, elem_classes=["stitch-sidebar"]):
             gr.Markdown("### Inbox")
             with gr.Row(elem_classes=["stitch-inbox-actions"], equal_height=False):
                 refresh_inbox_btn = gr.Button("Refresh", size="sm", min_width=80)
@@ -134,11 +134,11 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
                 buttons=[],
             )
 
-        with gr.Column(scale=8, min_width=560, elem_classes=["stitch-workspace"]):
+        with gr.Column(scale=8, min_width=460, elem_classes=["stitch-workspace"]):
             selected_look_bar = gr.HTML(value=format_look_bar(first_case))
 
             with gr.Row(elem_classes=["stitch-triad"], equal_height=False):
-                with gr.Column(scale=1, min_width=180):
+                with gr.Column(scale=1, min_width=120):
                     out_orig = gr.Image(
                         value=init_orig,
                         label="Original",
@@ -146,7 +146,7 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
                         height=225,
                         buttons=["fullscreen"],
                     )
-                with gr.Column(scale=1, min_width=180):
+                with gr.Column(scale=1, min_width=120):
                     out_ref = gr.Image(
                         value=init_ref,
                         label="Product Reference",
@@ -154,7 +154,7 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
                         height=225,
                         buttons=["fullscreen"],
                     )
-                with gr.Column(scale=1, min_width=180, elem_classes=["stitch-repaired-col"]):
+                with gr.Column(scale=1, min_width=120, elem_classes=["stitch-repaired-col"]):
                     out_final = gr.Image(
                         value=init_shown_final,
                         label="Repaired",

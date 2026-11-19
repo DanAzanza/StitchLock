@@ -81,24 +81,27 @@ body {
 }
 
 .stitch-sidebar > .styler,
+.stitch-sidebar > div:has(.gallery-container),
 .stitch-sidebar > div:has([data-testid="gallery"]) {
+    flex: 1 1 0% !important;
     display: flex !important;
     flex-direction: column !important;
-    min-height: 0 !important;
+    min-height: 240px !important;
 }
 
 .stitch-sidebar [data-testid="gallery"],
 .stitch-sidebar .gallery-container,
 .stitch-sidebar .grid-wrap,
 .stitch-sidebar .grid-wrap.fixed-height {
-    height: auto !important;
-    max-height: calc(100vh - 205px) !important;
+    flex: 1 1 0% !important;
+    height: 100% !important;
+    max-height: none !important;
     overflow-y: auto !important;
 }
 
 .stitch-sidebar .grid-wrap button.thumbnail-item {
-    height: 155px !important;
-    min-height: 155px !important;
+    height: clamp(115px, 14vh, 155px) !important;
+    min-height: 115px !important;
 }
 
 .stitch-workspace {
@@ -142,9 +145,15 @@ body {
     flex-grow: 0 !important;
 }
 
+.stitch-triad .block:not(.fullscreen),
 .stitch-triad .block:not(.fullscreen) .image-container,
 .stitch-triad .block:not(.fullscreen) [data-testid="image"] {
-    height: 225px !important;
+    height: clamp(140px, 19vh, 210px) !important;
+}
+
+.stitch-triad .block:not(.fullscreen) label {
+    white-space: nowrap !important;
+    font-size: clamp(0.66rem, 0.85vw, 0.82rem) !important;
 }
 
 .stitch-triad .image-frame {
@@ -178,13 +187,52 @@ body {
 
 /* Centered, uncropped, pixel-aligned stage for Before/After Compare Slider & Heatmap */
 .stitch-compare-stage {
-    max-width: 500px !important;
+    max-width: min(460px, 100%) !important;
     width: 100% !important;
     margin: 4px auto 0 auto !important;
 }
 
+.stitch-compare-stage .block:not(.fullscreen) {
+    height: clamp(240px, 36vh, 420px) !important;
+    max-height: clamp(240px, 36vh, 420px) !important;
+}
+
 .stitch-compare-stage img {
     object-fit: contain !important;
+}
+
+@media (max-width: 1100px) {
+    .gradio-container {
+        max-width: 100% !important;
+        padding: 10px 14px 12px 14px !important;
+    }
+
+    .stitch-sidebar,
+    .stitch-workspace {
+        padding: 10px !important;
+    }
+
+    .stitch-triad .block:not(.fullscreen),
+    .stitch-triad .block:not(.fullscreen) .image-container,
+    .stitch-triad .block:not(.fullscreen) [data-testid="image"] {
+        height: clamp(135px, 16vw, 190px) !important;
+    }
+}
+
+@media (max-width: 820px) {
+    .stitch-sidebar > .styler,
+    .stitch-sidebar > div:has(.gallery-container),
+    .stitch-sidebar > div:has([data-testid="gallery"]) {
+        flex: 0 0 auto !important;
+    }
+
+    .stitch-sidebar [data-testid="gallery"],
+    .stitch-sidebar .gallery-container,
+    .stitch-sidebar .grid-wrap,
+    .stitch-sidebar .grid-wrap.fixed-height {
+        height: auto !important;
+        max-height: 340px !important;
+    }
 }
 
 /* Fullscreen modal overlay for "+ Add Look" pop-up with transparent rounded corners */
