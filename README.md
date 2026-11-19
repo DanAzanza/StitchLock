@@ -187,29 +187,15 @@ We enforce unmasked preservation and masked-region quality through three complem
 1. **Tight Logo Cropping Loses Relative Garment Scale**:
    - Cropping out just the defective region and conditioning on a tight crop of the reference emblem removes global garment proportions (leg width, chest span, opposite emblem), causing **Qwen-Image 2.1** to over-scale replacement logos.
    - **Solution**: Conditioning on the full On-Model image (`<image1>`) and full Product Reference garment (`<image2>`, frame-aligned to match torso/leg coordinates when packshot headroom differs) while constraining denoising to the `Qwen3-VL` mask (`VAEEncode` + `SetLatentNoiseMask`) preserves authentic 1:1 logo proportions and keeps the model's pose intact.
-2. **Heuristic OpenCV Fallbacks Create "Patchwork / Sticker" Artifacts**:
-   - Attempting offline logo replacement via OpenCV stroke erasing and LAB-thresholded texture pasting strips local sheen and creates visible blurred rectangular patches when ComfyUI is offline.
-   - **Solution**: All OpenCV and cached ROI fallbacks were removed completely. If ComfyUI is unreachable, the pipeline fails fast with an explicit `ComfyExecutionError` rather than degrading visual quality.
-3. **High CFG Cross-Attention Bleeding ("Pink Elephant" Effect)**:
+2. **High CFG Cross-Attention Bleeding ("Pink Elephant" Effect)**:
    - Raising `CFG > 1.5` or adding verbose negative prompts in Qwen-Image 2.1 causes global layout contamination from `<image2>` into `<image1>`. Keeping `CFG = 1.0` (`euler` / `simple`, `steps = 20`, `denoise = 1.0`) with `SetLatentNoiseMask` yields natural fold integration while `PixelLockCompositor` restores exact outer pixels.
-4. **Dual-Image VLM Coordinate Echoing on Differently Framed Packshots**:
+3. **Dual-Image VLM Coordinate Echoing on Differently Framed Packshots**:
    - When comparing `<image1>` and `<image2>` in one pass, VLMs occasionally echo Image 1 coordinates onto plain cloth in Image 2 when vertical headroom differs, and viewer/wearer `"left/right chest"` phrasing misleads directional edits.
    - **Solution**: `Qwen3VLInspector` detects low-contrast reference boxes automatically and runs a solo-image lookup on `<image2>`, applies universal padding without color-specific hacks, deduplicates overlapping detections, and enforces direct `"Replace..."` prompts without ambiguous left/right labels.
 
 ---
 
-## 4. What I Would Try Next in Production
-
-1. **Pose-Aware Garment & Logo Perspective Alignment**:
-   - Currently, `_align_full_garment_reference` aligns the reference garment frame to the On-Model frame via 2D translation when framing headroom differs. When a model turns sharply sideways or wears a garment at an extreme perspective angle, a rigid translation cannot match foreshortening.
-   - **Next Step**: Use lightweight pose/garment keypoint estimation (e.g. shoulder/chest/hem anchors or DensePose UV) to scale and gently perspective-align the full reference garment frame before passing `<image2>` into `Qwen-Image 2.1`, keeping 1:1 logo proportions across angled poses.
-2. **Parallelized Multi-GPU / Cloud Batch Inference**:
-   - Currently, sequential 20-step `Qwen3-VL-8B` + `Qwen-Image 2.1` inference runs one item at a time on a single local ComfyUI instance, scaling linearly with catalog batch size.
-   - **Next Step**: Add an async worker pool or cloud inference adapter in `src/comfy_client.py` to process catalog batches in parallel while keeping Stage 1 (Auto-Masker), Stage 3 (Strict Pixel-Lock Compositor), and Stage 4 (Automated Verification Gate) locally enforced as an immutable quality firewall.
-
----
-
-## 5. Quickstart & Reproducible Verification
+## 4. Quickstart & Reproducible Verification
 
 ### Option A: 1-Click Artist Studio Launcher (Windows & Linux/macOS)
 - **Windows**: Double-click **`install.bat`** once to set up the environment, then launch **`run_pipeline.bat`** to start ComfyUI automatically, open the interactive Web UI (`http://127.0.0.1:7860`) in your browser, manage the `test_cases/` inbox (single-case processing or full batch), and cleanly shut down ComfyUI when the browser tab closes.
