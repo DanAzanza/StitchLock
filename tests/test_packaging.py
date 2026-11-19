@@ -257,7 +257,7 @@ def test_version_alignment_cli_and_release_workflow(
     ]["version"]
     assert src.__version__ == pyproject_ver
     assert resolve_default_version(REPO_ROOT) == pyproject_ver
-    assert resolve_default_version(tmp_path) == "1.0.0"
+    assert resolve_default_version(tmp_path) == "1.0.1"
 
     args = parse_args(["--version", "v1.0.0", "--verbose", "--output-dir", "custom_dist"])
     assert args.version == "v1.0.0"

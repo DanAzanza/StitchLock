@@ -283,7 +283,7 @@ def resolve_default_version(repo_root: Path) -> str:
         match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
         if match:
             return match.group(1)
-    return "1.0.0"
+    return "1.0.1"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
