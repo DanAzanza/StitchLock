@@ -3,11 +3,13 @@
 **Automated E-Commerce Garment Detail Correction Pipeline with Strict Unmasked RGB Pixel-Lock Verification**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![CI Quality Gate](https://img.shields.io/badge/CI-Ruff%20%7C%20Pyright%20%7C%20Pytest-brightgreen.svg)](.github/workflows/ci.yml)
+[![Release v1.0.0](https://img.shields.io/badge/release-v1.0.0-emerald.svg)](https://github.com/DanAzanza/StitchLock/releases)
+[![CI Quality Gate](https://github.com/DanAzanza/StitchLock/actions/workflows/ci.yml/badge.svg)](https://github.com/DanAzanza/StitchLock/actions/workflows/ci.yml)
 [![ComfyUI API](https://img.shields.io/badge/ComfyUI-REST%20%2F%20WebSocket-orange.svg)](workflows/qwen_2_1_edit_api.json)
 [![Architecture: DiT](https://img.shields.io/badge/Model-Qwen--Image%202.1%20Edit-purple.svg)](.agents/PROJECT.md)
 [![Pixel-Lock](https://img.shields.io/badge/Pixel--Lock-Unmasked%20RGB%20Verified-success.svg)](src/verifier.py)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ---
 
@@ -101,7 +103,9 @@ sequenceDiagram
 ### Repository Structure
 ```text
 StitchLocker/
-├── .github/workflows/ci.yml            # Multi-OS (Ubuntu & Windows) & Python 3.11/3.12 CI Quality Gate
+├── .github/workflows/
+│   ├── ci.yml                          # Multi-OS (Ubuntu & Windows) & Python 3.11/3.12 CI Quality Gate
+│   └── release.yml                     # Tag-triggered GitHub Release builder & checksum uploader
 ├── config.yaml                         # Centralized pipeline, masking, ComfyUI, verification & heuristic config
 ├── pyproject.toml                      # Project metadata, dependencies, Ruff, Pyright & Pytest config
 ├── requirements.txt                    # Runtime, Studio UI & CI dependencies
@@ -118,7 +122,8 @@ StitchLocker/
 │   ├── qwen3_vl_inspector_api.json     # ComfyUI API graph for Qwen3-VL-8B defect detection
 │   └── qwen_2_1_edit_api.json          # 14-node ComfyUI graph (ImageScaleToTotalPixels + TextEncodeQwenImage21 + SetLatentNoiseMask)
 ├── scripts/
-│   └── run_ci_locally.py               # Local CI Quality Gate runner (Ruff + Formatter + Pyright + Pytest)
+│   ├── run_ci_locally.py               # Local CI Quality Gate runner (Ruff + Formatter + Pyright + Pytest)
+│   └── package_release.py              # Standalone release zip & SHA256SUMS.txt archive builder
 ├── src/
 │   ├── models.py                       # Immutable domain dataclasses, config loader & path safety guards
 │   ├── vlm_heuristics.py               # Configurable CV box refinement, 3x3 garment scan & shift-splitting heuristics
@@ -135,12 +140,9 @@ StitchLocker/
 │   ├── ui_custom_handlers.py           # Custom upload, interactive VLM box overlay & ROI preview handlers
 │   ├── ui_style.css                    # Full-height 2-column & modal overlay Artist Studio styling
 │   ├── ci.py                           # Multi-stage local CI verification orchestrator
+│   ├── packaging.py                    # Deterministic zip & SHA-256 release packaging engine
 │   └── pipeline.py                     # End-to-end orchestrator with shared VLM post-check & atomic .part writes
-├── test_cases/
-│   ├── kova_zip_jacket.png             # Synthetic Case 1: On-Model photo (defect)
-│   ├── kova_zip_jacket_reference.png   # Synthetic Case 1: Authentic front product reference
-│   ├── sage_sweatpant.png              # Synthetic Case 2: On-Model photo (defect)
-│   └── sage_sweatpant_reference.png    # Synthetic Case 2: Authentic front product reference
+├── test_cases/                         # 6 synthetic lookbook/packshot pairs (12 PNGs: kova, sage, ember, cobalt, cream, burgundy)
 ├── outputs/
 │   ├── <name>.png                      # Repaired final images matching input case filenames (gitignored locally)
 │   └── _reports/                       # 4-panel verification PNGs, diff heatmaps (`_diff_heatmap_x4.png`) & JSONs
@@ -149,6 +151,7 @@ StitchLocker/
     ├── test_comfy_and_vlm.py           # ComfyUI bridge, VLM parsing, heuristics, housekeeper & ComfyServerManager tests
     ├── test_pipeline_and_ui.py         # Compositor, 2D SSIM verifier, metadata, pipeline & Studio UI tests
     ├── test_verifier_and_post_check.py # Typography SSIM/Sobel discrimination & fail-closed VLM post-check tests
+    ├── test_packaging.py               # Release archive, SHA-256 checksum & version alignment tests
     └── test_generalization.py          # 10-case holdout generalization + real studio asset verification suite
 ```
 

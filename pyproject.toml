@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Daniel Azanza Hartmann" }]
+urls = { Homepage = "https://github.com/DanAzanza/StitchLock", Repository = "https://github.com/DanAzanza/StitchLock.git", Issues = "https://github.com/DanAzanza/StitchLock/issues", Releases = "https://github.com/DanAzanza/StitchLock/releases" }
 dependencies = [
     "numpy>=1.26.0",
     "opencv-python-headless>=4.9.0",
@@ -35,13 +36,13 @@ addopts = "-v --tb=short"
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests"]
-extend-exclude = ["outputs", "test_cases"]
+src = ["src", "scripts", "tests"]
+extend-exclude = ["outputs", "test_cases", "dist", "build"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [tool.pyright]
-include = ["src", "tests", "setup_test_cases.py", "run_batch.py", "app.py"]
+include = ["src", "scripts", "tests", "setup_test_cases.py", "run_batch.py", "app.py"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
