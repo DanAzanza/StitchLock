@@ -583,6 +583,22 @@ def _build_garment_scan_zones(
     return pairs, m_bounds, r_bounds
 
 
+def _emblem_patch_salience(image_rgb: NDArray[np.uint8], box: NormalizedBox) -> tuple[float, float]:
+    """Return (95th-percentile RGB diff from local cloth median, patch RGB std)."""
+    h, w = image_rgb.shape[:2]
+    px = box.to_pixel_bbox(w, h)
+    pad = 4
+    crop = image_rgb[
+        max(0, px.y1 - pad) : min(h, px.y2 + pad),
+        max(0, px.x1 - pad) : min(w, px.x2 + pad),
+    ].astype(np.float32)
+    if crop.size == 0:
+        return 0.0, 0.0
+    cloth = np.median(crop.reshape(-1, 3), axis=0)
+    dist = np.linalg.norm(crop - cloth.reshape(1, 1, 3), axis=2)
+    return float(np.percentile(dist, 95)), float(np.std(crop))
+
+
 def detect_micro_emblem_defect(
     model_rgb: NDArray[np.uint8],
     ref_rgb: NDArray[np.uint8],
@@ -595,7 +611,7 @@ def detect_micro_emblem_defect(
     """
     _ = source_label
     zone_pairs, m_bounds, r_bounds = _build_garment_scan_zones(model_rgb, ref_rgb, heuristics)
-    best_match: tuple[float, NormalizedBox, NormalizedBox] | None = None
+    best_match: tuple[float, float, NormalizedBox, NormalizedBox] | None = None
     for m_zone, r_zone in zone_pairs:
         m_emblem = find_salient_emblem_box(
             model_rgb, m_zone, heuristics=heuristics, garment_bounds=m_bounds
@@ -605,15 +621,22 @@ def detect_micro_emblem_defect(
         )
         if m_emblem is None or r_emblem is None:
             continue
+        m_p95, m_std = _emblem_patch_salience(model_rgb, m_emblem)
+        r_p95, r_std = _emblem_patch_salience(ref_rgb, r_emblem)
+        min_p95 = min(m_p95, r_p95)
+        min_std = min(m_std, r_std)
+        # Reject faint plaid texture, fabric folds, and sleeve-seam highlights
+        if min_p95 < 120.0 or min_std < 34.0:
+            continue
         corr = emblem_pattern_correlation(model_rgb, m_emblem, ref_rgb, r_emblem)
-        if corr < heuristics.emblem_correlation_threshold and (
-            best_match is None or corr < best_match[0]
-        ):
-            best_match = (corr, m_emblem, r_emblem)
+        if corr < heuristics.emblem_correlation_threshold:
+            salience_score = min_p95 * min_std * (1.0 - max(-0.5, corr))
+            if best_match is None or salience_score > best_match[0]:
+                best_match = (salience_score, corr, m_emblem, r_emblem)
 
     if best_match is None:
         return None
-    corr, m_emblem, r_emblem = best_match
+    _, corr, m_emblem, r_emblem = best_match
 
     m_w = m_emblem.x_max - m_emblem.x_min
     m_h = m_emblem.y_max - m_emblem.y_min

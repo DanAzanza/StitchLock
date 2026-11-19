@@ -418,6 +418,22 @@ def test_micro_emblem_detection_and_negative_boundaries() -> None:
         is None
     )
 
+    # Faint lower plaid/fold highlights must not override a real chest emblem or clean plaid
+    plaid_clean = clean_jkt.copy()
+    plaid_clean[295:325, 195:225] = np.array([75, 84, 88], dtype=np.uint8)
+    plaid_ref = ref_jkt.copy()
+    plaid_ref[290:315, 210:238] = np.array([72, 82, 86], dtype=np.uint8)
+    assert (
+        Qwen3VLInspector.parse_vlm_json_response(no_defect_json, plaid_clean, plaid_ref).has_defect
+        is False
+    )
+
+    plaid_broken = broken_jkt.copy()
+    plaid_broken[295:325, 195:225] = np.array([75, 84, 88], dtype=np.uint8)
+    plaid_res = Qwen3VLInspector.parse_vlm_json_response(no_defect_json, plaid_broken, plaid_ref)
+    assert plaid_res.has_defect is True
+    assert plaid_res.model_target_box.y_max < 0.45
+
 
 def test_housekeeper_protects_preexisting_and_blocks_traversal(tmp_path: Path) -> None:
     assert is_loopback_host("http://127.0.0.1:8188") is True
