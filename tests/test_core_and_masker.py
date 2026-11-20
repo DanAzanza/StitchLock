@@ -488,3 +488,143 @@ def test_standalone_logo_masker_and_transparent_png_handling(tmp_path: Path) -> 
     assert right_span > left_span
     # Outside target_bbox, precomposite preserves clean_model_rgb untouched
     assert np.array_equal(precomp[:, :110], pose_model[:, :110])
+
+
+def test_surface_warp_slope_folds_and_relighting() -> None:
+    """Verify cloth surface slope fitting, fold displacement, and irradiance shading."""
+    from src.surface_warp import (
+        _compute_fold_displacement_and_shading,
+        fit_garment_surface_geometry,
+    )
+
+    # Shaded garment patch with dark fold crease, upward-right directional light, & slanted print
+    h, w = 240, 320
+    clean = np.full((h, w, 3), 240, dtype=np.uint8)
+    xs = np.arange(w, dtype=np.float32)[None, :]
+    # Garment silhouette spanning x=40..280 with lighting ramp and central vertical fold trough
+    cloth_lum = 75.0 + 45.0 * np.clip((xs - 40.0) / 240.0, 0.0, 1.0)
+    cloth_lum -= 26.0 * np.exp(-(((xs - 140.0) / 10.0) ** 2))
+    cloth_lum = np.broadcast_to(cloth_lum, (h, w)).astype(np.uint8)
+    clean[30:220, 40:280, :] = cloth_lum[30:220, 40:280, None]
+
+    # Original print sloping UPWARD left-to-right (dy/dx ≈ -0.15) plus taller center emblem
+    orig = clean.copy()
+    bbox = PixelBBox(50, 70, 210, 170)
+    for x in range(60, 200):
+        y_line = int(round(135 - 0.15 * (x - 130)))
+        orig[y_line - 10 : y_line + 10, x] = (235, 235, 225)
+    # Taller centered emblem above middle columns (should not invert baseline slope)
+    orig[80:115, 115:145] = (235, 235, 225)
+
+    geom = fit_garment_surface_geometry(
+        clean_model_rgb=clean,
+        target_bbox=bbox,
+        perspective_skew=-0.18,
+        original_model_rgb=orig,
+    )
+    assert geom.baseline_slope < -0.05
+    assert geom.arc_strength > 0.3
+
+    # Flat uniform clean image -> zero baseline slope and identity fold/shading maps
+    flat_clean = np.full((h, w, 3), 240, dtype=np.uint8)
+    flat_clean[30:220, 40:280] = (90, 95, 100)
+    dx_flat, dy_flat, shade_flat, weave_flat = _compute_fold_displacement_and_shading(
+        clean_model_rgb=flat_clean,
+        ox1=60,
+        oy1=85,
+        placed_w=140,
+        placed_h=60,
+        geometry=geom,
+    )
+    assert np.allclose(dx_flat, 0.0)
+    assert np.allclose(dy_flat, 0.0)
+    assert np.allclose(shade_flat, 1.0)
+    assert np.allclose(weave_flat, 0.0)
+
+    # Shaded & folded garment -> real displacement around crease and darker left/fold shading
+    dx_fold, dy_fold, shade_fold, _ = _compute_fold_displacement_and_shading(
+        clean_model_rgb=clean,
+        ox1=60,
+        oy1=85,
+        placed_w=140,
+        placed_h=60,
+        geometry=geom,
+    )
+    assert float(np.max(np.abs(dx_fold))) > 0.5
+    assert float(np.max(np.abs(dy_fold))) > 0.5
+    assert float(shade_fold[:, 10].mean()) < float(shade_fold[:, -10].mean())
+
+    # Projected logo onto folded/slanted fabric respects left/right shading and stays inside mask
+    logo_ref = np.zeros((160, 320, 3), dtype=np.uint8)
+    logo_ref[40:120, 20:300] = (240, 200, 50)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[bbox.y1 : bbox.y2, bbox.x1 : bbox.x2] = 1
+    projected = AutoMasker.build_perspective_logo_precomposite(
+        clean_model_rgb=clean,
+        ref_rgb=logo_ref,
+        target_bbox=bbox,
+        ref_detail_bbox=PixelBBox(20, 40, 300, 120),
+        perspective_skew=-0.18,
+        binary_mask=mask,
+        original_model_rgb=orig,
+    )
+    assert np.array_equal(projected[mask == 0], clean[mask == 0])
+    # Shaded left logo pixels are measurably darker than lit right logo pixels
+    left_lum = float(projected[95:145, 70:95].mean())
+    right_lum = float(projected[90:135, 175:195].mean())
+    assert left_lum < right_lum
+
+    # Boundary & negative checks: out-of-bounds bbox, narrow 10x10 bbox, shape mismatch
+    oob_bbox = PixelBBox(w + 10, h + 10, w + 40, h + 40)
+    oob_out = AutoMasker.build_perspective_logo_precomposite(
+        clean_model_rgb=clean,
+        ref_rgb=logo_ref,
+        target_bbox=oob_bbox,
+        ref_detail_bbox=PixelBBox(20, 40, 300, 120),
+        perspective_skew=-0.18,
+        original_model_rgb=orig,
+    )
+    assert np.array_equal(oob_out, clean)
+
+    partial_oob_bbox = PixelBBox(w - 25, h - 25, w + 30, h + 30)
+    partial_out = AutoMasker.build_perspective_logo_precomposite(
+        clean_model_rgb=clean,
+        ref_rgb=logo_ref,
+        target_bbox=partial_oob_bbox,
+        ref_detail_bbox=PixelBBox(20, 40, 300, 120),
+        perspective_skew=0.18,
+        original_model_rgb=orig,
+    )
+    assert np.array_equal(partial_out[: h - 25, :], clean[: h - 25, :])
+
+    narrow_bbox = PixelBBox(100, 100, 110, 110)
+    narrow_out = AutoMasker.build_perspective_logo_precomposite(
+        clean_model_rgb=clean,
+        ref_rgb=logo_ref,
+        target_bbox=narrow_bbox,
+        ref_detail_bbox=PixelBBox(20, 40, 300, 120),
+        perspective_skew=-0.15,
+    )
+    assert np.array_equal(narrow_out[:, :100], clean[:, :100])
+    assert np.array_equal(narrow_out[:, 110:], clean[:, 110:])
+    assert np.array_equal(narrow_out[:100, :], clean[:100, :])
+    assert np.array_equal(narrow_out[110:, :], clean[110:, :])
+
+    mismatched_orig = orig[:100, :100].copy()
+    geom_mismatch = fit_garment_surface_geometry(
+        clean_model_rgb=clean,
+        target_bbox=bbox,
+        perspective_skew=-0.18,
+        original_model_rgb=mismatched_orig,
+    )
+    assert geom_mismatch.baseline_slope == 0.0
+
+    bad_mask = np.ones((h // 2, w), dtype=np.uint8)
+    with pytest.raises(LocalizationError, match="binary_mask shape"):
+        AutoMasker.build_perspective_logo_precomposite(
+            clean_model_rgb=clean,
+            ref_rgb=logo_ref,
+            target_bbox=bbox,
+            ref_detail_bbox=PixelBBox(20, 40, 300, 120),
+            binary_mask=bad_mask,
+        )

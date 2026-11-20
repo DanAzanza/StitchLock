@@ -18,6 +18,7 @@ from src.comfy_client import ComfyQwenBridge
 from src.compositor import PixelLockCompositor
 from src.metadata import embed_png_provenance_metadata, read_png_text_chunks
 from src.models import (
+    CaseManifest,
     ComfyConfig,
     ComfyExecutionError,
     ConfigurationError,
@@ -28,6 +29,7 @@ from src.models import (
     PipelineConfig,
     PipelineError,
     PixelBBox,
+    ReferenceType,
     VerificationConfig,
     VerificationError,
     load_pipeline_config,
@@ -734,3 +736,79 @@ def test_ui_add_pair_to_inbox_tile_and_collision_handling(tmp_path: Path) -> Non
         add_pair_to_inbox(None, ref_file, config_override=cfg)
     with pytest.raises(PipelineError):
         add_pair_to_inbox(model_file, None, config_override=cfg)
+
+
+def test_logo_two_pass_surface_precomposite_and_pixel_lock() -> None:
+    """Verify ReferenceType.LOGO runs ERASE (1.0) -> surface precomposite -> HARMONIZE (0.48)."""
+
+    class _RecordingLogoBridge(_StubComfyBridge):
+        def __init__(self, config: ComfyConfig, workflow_path: Path) -> None:
+            super().__init__(config, workflow_path)
+            self.calls: list[tuple[str, float | None, NDArray[np.uint8]]] = []
+
+        def restore_detail_roi(
+            self,
+            cropped_model_roi: NDArray[np.uint8],
+            cropped_product_ref: NDArray[np.uint8],
+            cropped_mask_greyscale: NDArray[np.uint8],
+            prompt: str,
+            case_id: str,
+            *,
+            denoise_override: float | None = None,
+        ) -> tuple[NDArray[np.uint8], str]:
+            _ = prompt
+            self._validate_inputs(cropped_model_roi, cropped_product_ref, cropped_mask_greyscale)
+            self.calls.append((case_id, denoise_override, cropped_model_roi.copy()))
+            self.restore_calls += 1
+            if case_id.endswith("_erase"):
+                # Return plain shaded cloth matching outer garment gradient
+                clean = np.full_like(cropped_model_roi, (70, 72, 76), dtype=np.uint8)
+                return clean, "comfyui_qwen_2_1 (stub)"
+            return cropped_model_roi.copy(), "comfyui_qwen_2_1 (stub)"
+
+    cfg = load_pipeline_config(ROOT_DIR / "config.yaml", base_dir=ROOT_DIR)
+    model_rgb = np.full((320, 320, 3), 240, dtype=np.uint8)
+    model_rgb[40:300, 60:240] = (70, 72, 76)
+    model_rgb[130:170, 75:175] = (230, 230, 225)  # Existing print to erase
+    ref_rgb = np.zeros((256, 256, 3), dtype=np.uint8)
+    ref_rgb[90:166, 20:236] = (245, 195, 55)
+
+    manifest = CaseManifest(
+        case_id="logo_two_pass_unit",
+        title="Logo Two Pass",
+        garment_category="hoodie",
+        target_detail="Replace print with NEXORA logo",
+        prompt="Edit <image1>: Replace print with NEXORA logo from <image2>.",
+        model_image_filename="m.png",
+        reference_image_filename="r.png",
+        model_target_box=NormalizedBox(0.22, 0.38, 0.56, 0.56),
+        reference_detail_box=NormalizedBox(0.08, 0.35, 0.92, 0.65),
+        reference_type=ReferenceType.LOGO,
+    )
+    defect = DefectTarget(
+        defect_summary=manifest.target_detail,
+        model_target_box=manifest.model_target_box,
+        reference_detail_box=manifest.reference_detail_box,
+        edit_prompt=manifest.prompt,
+    )
+    bridge = _RecordingLogoBridge(cfg.comfyui, cfg.workflow_path)
+    out = execute_multi_defect_restoration(
+        original_model_rgb=model_rgb,
+        ref_rgb=ref_rgb,
+        base_manifest=manifest,
+        defects=[defect],
+        masker=AutoMasker(cfg.masking),
+        bridge=bridge,
+        compositor=PixelLockCompositor(),
+    )
+    assert len(bridge.calls) == 2
+    assert bridge.calls[0][0] == "logo_two_pass_unit_erase"
+    assert bridge.calls[0][1] == 1.0
+    assert bridge.calls[1][0] == "logo_two_pass_unit_harmonize"
+    assert bridge.calls[1][1] == pytest.approx(0.48)
+    # Harmonize input contains projected golden logo pixels on clean cloth
+    harm_roi = bridge.calls[1][2]
+    assert int(np.count_nonzero((harm_roi[..., 0] > 180) & (harm_roi[..., 2] < 100))) > 50
+    # Strict pixel-lock outside binary_mask
+    unmasked = out.localization.binary_mask == 0
+    assert np.array_equal(out.final_corrected_rgb[unmasked], model_rgb[unmasked])

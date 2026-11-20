@@ -315,6 +315,7 @@ def execute_multi_defect_restoration(
                 ref_detail_bbox=loc.ref_detail_bbox,
                 perspective_skew=skew,
                 binary_mask=loc.binary_mask,
+                original_model_rgb=current_rgb,
             )
             cb = loc.context_bbox
             harmonize_roi = precomp_rgb[cb.y1 : cb.y2, cb.x1 : cb.x2].copy()
@@ -324,7 +325,7 @@ def execute_multi_defect_restoration(
                 cropped_mask_greyscale=loc.cropped_mask_greyscale,
                 prompt=defect.edit_prompt,
                 case_id=f"{step_case_id}_harmonize",
-                denoise_override=0.65,
+                denoise_override=0.48,
             )
         else:
             restored_roi_rgb, backend_used = bridge.restore_detail_roi(
