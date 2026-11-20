@@ -23,7 +23,6 @@ from src.models import (
     resolve_safe_path,
 )
 from src.vlm_heuristics import (
-    compute_foreground_mask,
     sample_four_corner_bg_rgb,
     sample_studio_bg_rgb,
 )
@@ -442,9 +441,6 @@ class AutoMasker:
 
         binary_mask = np.zeros((image_height, image_width), dtype=np.uint8)
         binary_mask[y1:y2, x1:x2] = 1
-        clipped_fg = AutoMasker._clip_box_to_studio_foreground(model_rgb, x1, y1, x2, y2)
-        if clipped_fg is not None:
-            binary_mask[y1:y2, x1:x2] = clipped_fg
 
         # Compute Euclidean distance to the nearest zero pixel (strictly inside binary_mask == 1)
         dist = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
@@ -457,57 +453,6 @@ class AutoMasker:
         # Enforce hard zero outside binary_mask
         feathered = np.where(binary_mask > 0, feathered, np.float32(0.0))
         return binary_mask, feathered
-
-    @staticmethod
-    def _clip_box_to_studio_foreground(
-        model_rgb: NDArray[np.uint8],
-        x1: int,
-        y1: int,
-        x2: int,
-        y2: int,
-    ) -> NDArray[np.uint8] | None:
-        """Clip only unmistakable exterior studio backdrop from a garment-edge mask box."""
-        image_height, image_width = model_rgb.shape[:2]
-        c_w = max(4, image_width // 20)
-        c_h = max(4, image_height // 20)
-        corners = np.concatenate(
-            [
-                model_rgb[0:c_h, 0:c_w, :].reshape(-1, 3),
-                model_rgb[0:c_h, image_width - c_w : image_width, :].reshape(-1, 3),
-            ],
-            axis=0,
-        ).astype(np.float32)
-        corner_std = float(np.max(np.std(corners, axis=0)))
-        if corner_std > 12.0:
-            return None
-
-        bg_med = np.asarray(np.median(corners, axis=0), dtype=np.float32)
-        bg_thr = min(14.0, max(6.0, corner_std * 2.0 + 3.0))
-        fg_full = compute_foreground_mask(model_rgb.astype(np.float32), bg_med, bg_thr)
-        fg_in_box = fg_full[y1:y2, x1:x2]
-        fg_frac = float(np.mean(fg_in_box))
-        if not (0.35 <= fg_frac < 1.0) or int(np.count_nonzero(fg_in_box)) < 64:
-            return None
-
-        # At least one full box side must lie solidly inside the garment, never all-around cloth
-        max_side_fg = max(
-            float(np.mean(fg_in_box[:, 0])),
-            float(np.mean(fg_in_box[:, -1])),
-            float(np.mean(fg_in_box[0, :])),
-            float(np.mean(fg_in_box[-1, :])),
-        )
-        if max_side_fg < 0.85:
-            return None
-
-        patch_f = model_rgb[y1:y2, x1:x2].astype(np.float32)
-        bg_diff_mean = float(np.mean(np.linalg.norm(patch_f[~fg_in_box] - bg_med, axis=1)))
-        if bg_diff_mean > min(8.0, bg_thr * 0.65):
-            return None
-
-        fg_med = np.median(patch_f[fg_in_box], axis=0)
-        if float(np.linalg.norm(fg_med - bg_med)) < 45.0:
-            return None
-        return fg_in_box.astype(np.uint8)
 
     @staticmethod
     def _align_full_garment_reference(
@@ -599,6 +544,7 @@ class AutoMasker:
         target_bbox: PixelBBox,
         ref_detail_bbox: PixelBBox,
         perspective_skew: float = 0.0,
+        binary_mask: NDArray[np.uint8] | None = None,
     ) -> NDArray[np.uint8]:
         """Project a standalone logo with 2.5D homography + cylindrical warp onto clean fabric."""
         logo_crop = ref_rgb[
@@ -727,6 +673,9 @@ class AutoMasker:
         sx1, sy1 = cx1 - ox1, cy1 - oy1
         sx2, sy2 = sx1 + (cx2 - cx1), sy1 + (cy2 - cy1)
         a_patch = warped_alpha[sy1:sy2, sx1:sx2, None]
+        if binary_mask is not None:
+            mask_patch = (binary_mask[cy1:cy2, cx1:cx2] > 0).astype(np.float32)[..., None]
+            a_patch = a_patch * mask_patch
         rgb_patch = warped_rgb[sy1:sy2, sx1:sx2].astype(np.float32)
         cloth_patch = out[cy1:cy2, cx1:cx2].astype(np.float32)
         blended = rgb_patch * a_patch + cloth_patch * (1.0 - a_patch)

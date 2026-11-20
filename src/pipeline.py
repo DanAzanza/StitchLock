@@ -289,7 +289,8 @@ def execute_multi_defect_restoration(
             erase_prompt = (
                 "Edit <image1>: Remove and erase the printed graphic/wordmark inside the "
                 "masked region completely, leaving clean seamless plain garment fabric matching "
-                "the surrounding cloth color, texture, folds, hood, and lighting."
+                "the surrounding cloth color, texture, folds, and lighting while keeping any "
+                "overlapping foreground hood, collar, or hair completely intact."
             )
             erased_roi, _ = bridge.restore_detail_roi(
                 cropped_model_roi=loc.cropped_model_roi,
@@ -313,6 +314,7 @@ def execute_multi_defect_restoration(
                 target_bbox=loc.target_bbox,
                 ref_detail_bbox=loc.ref_detail_bbox,
                 perspective_skew=skew,
+                binary_mask=loc.binary_mask,
             )
             cb = loc.context_bbox
             harmonize_roi = precomp_rgb[cb.y1 : cb.y2, cb.x1 : cb.x2].copy()
@@ -322,7 +324,7 @@ def execute_multi_defect_restoration(
                 cropped_mask_greyscale=loc.cropped_mask_greyscale,
                 prompt=defect.edit_prompt,
                 case_id=f"{step_case_id}_harmonize",
-                denoise_override=0.58,
+                denoise_override=0.65,
             )
         else:
             restored_roi_rgb, backend_used = bridge.restore_detail_roi(

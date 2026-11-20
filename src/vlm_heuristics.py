@@ -118,9 +118,15 @@ def tighten_target_graphic_box(
 
     cloth_med = np.median(patch[fg], axis=0)
     diff_cloth = np.linalg.norm(patch - cloth_med.reshape(1, 1, 3), axis=2)
-    thr = max(45.0, float(np.percentile(diff_cloth[fg], 92)))
-    sal = (diff_cloth >= thr) & fg
-    ys, xs = np.where(sal)
+    thr = max(45.0, min(85.0, float(np.percentile(diff_cloth[fg], 85))))
+    sal_raw = ((diff_cloth >= thr) & fg).astype(np.uint8)
+    sal_open = cv2.morphologyEx(sal_raw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    num_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(sal_open)
+    sal = np.zeros_like(sal_open)
+    for lbl in range(1, num_lbl):
+        if int(stats[lbl, cv2.CC_STAT_AREA]) >= 25:
+            sal[labels == lbl] = 1
+    ys, xs = np.where(sal > 0)
     if xs.size < 40 or ys.size < 40:
         return vlm_box
 

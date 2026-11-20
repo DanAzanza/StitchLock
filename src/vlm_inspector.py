@@ -139,7 +139,8 @@ LOGO_REFERENCE_INSPECTION_PROMPT = (
     "position of the old graphic and warped in 3D perspective to match the angled surface, "
     "curvature, and foreshortening of the garment back/front (tapering naturally toward the "
     "receding edge), with realistic matte screen-print texture, fabric grain, folds, and "
-    "shadows matching the garment's existing prints, keeping the garment color, hood, and all "
+    "shadows matching the garment's existing prints, keeping any overlapping foreground hood, "
+    "collar, hair, or folds cleanly in front of the logo, keeping the garment color and all "
     "other graphics completely unchanged, without copying any background rectangle from "
     '<image2>."\n'
     "Respond ONLY with valid JSON:\n"

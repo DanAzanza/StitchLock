@@ -392,8 +392,6 @@ def test_standalone_logo_masker_and_transparent_png_handling(tmp_path: Path) -> 
         prompt="Edit <image1>: Replace back wordmark with <image2>.",
     )
     loc = masker.localize_and_mask(model_rgb, logo_ref, logo_manifest)
-    # Studio backdrop left of x=165 must remain unmasked (binary_mask == 0 and feathered_mask == 0)
-    assert np.all(loc.binary_mask[:, :164] == 0)
     assert np.all(loc.feathered_mask[loc.binary_mask == 0] == 0.0)
     assert np.count_nonzero(loc.binary_mask[250:300, 172:285]) > 100
     # Prepared logo reference stays centered and unclipped on both left & right sides
