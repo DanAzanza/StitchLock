@@ -22,7 +22,11 @@ from src.models import (
     ReferenceType,
     resolve_safe_path,
 )
-from src.vlm_heuristics import compute_foreground_mask, sample_four_corner_bg_rgb
+from src.vlm_heuristics import (
+    compute_foreground_mask,
+    sample_four_corner_bg_rgb,
+    sample_studio_bg_rgb,
+)
 
 SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 REFERENCE_STEM_SUFFIX = "_reference"
@@ -283,6 +287,12 @@ class AutoMasker:
         )
         full_mask_greyscale = np.clip(np.round(feathered_mask * 255.0), 0, 255).astype(np.uint8)
 
+        perspective_skew = (
+            self._estimate_garment_perspective_skew(model_rgb, target_bbox)
+            if manifest.reference_type == ReferenceType.LOGO
+            else 0.0
+        )
+
         if is_micro_target:
             context_bbox, cropped_model_roi, cropped_product_ref, cropped_mask_greyscale = (
                 self._build_micro_roi_crops(
@@ -299,6 +309,7 @@ class AutoMasker:
                     ref_rgb=ref_rgb,
                     ref_detail_bbox=ref_detail_bbox,
                     target_size=(context_bbox.width, context_bbox.height),
+                    perspective_skew=perspective_skew,
                 )
         else:
             context_bbox = PixelBBox(x1=0, y1=0, x2=width, y2=height)
@@ -307,6 +318,7 @@ class AutoMasker:
                 self._prepare_standalone_logo_reference(
                     ref_rgb=ref_rgb,
                     ref_detail_bbox=ref_detail_bbox,
+                    perspective_skew=perspective_skew,
                 )
                 if manifest.reference_type == ReferenceType.LOGO
                 else self._align_full_garment_reference(
@@ -554,12 +566,39 @@ class AutoMasker:
         return np.asarray(aligned, dtype=np.uint8)
 
     @staticmethod
+    def _estimate_garment_perspective_skew(
+        model_rgb: NDArray[np.uint8],
+        target_bbox: PixelBBox,
+    ) -> float:
+        """Estimate horizontal 3/4 garment surface foreshortening (+ right recedes, - left)."""
+        h, w = model_rgb.shape[:2]
+        if h < 32 or w < 32:
+            return 0.0
+        bg_med = sample_studio_bg_rgb(model_rgb)
+        band = model_rgb[target_bbox.y1 : target_bbox.y2, :, :].astype(np.float32)
+        if band.size == 0:
+            return 0.0
+        fg_cols = np.where((np.linalg.norm(band - bg_med, axis=2) > 24.0).mean(axis=0) > 0.25)[0]
+        if fg_cols.size < max(16, int(round(w * 0.12))):
+            return 0.0
+        gx1, gx2 = int(fg_cols[0]), int(fg_cols[-1])
+        span = float(gx2 - gx1)
+        if span < w * 0.12:
+            return 0.0
+        t_cx = 0.5 * (target_bbox.x1 + target_bbox.x2)
+        rel_cx = (t_cx - gx1) / span
+        if 0.42 <= rel_cx <= 0.58:
+            return 0.0
+        return float(np.clip((0.5 - rel_cx) * 0.70, -0.22, 0.22))
+
+    @staticmethod
     def _prepare_standalone_logo_reference(
         ref_rgb: NDArray[np.uint8],
         ref_detail_bbox: PixelBBox,
         target_size: tuple[int, int] | None = None,
+        perspective_skew: float = 0.0,
     ) -> NDArray[np.uint8]:
-        """Center a standalone logo crop on its uniform backdrop without clipping sides."""
+        """Center and optionally perspective-warp a standalone logo crop onto its backdrop."""
         logo_crop = ref_rgb[
             ref_detail_bbox.y1 : ref_detail_bbox.y2,
             ref_detail_bbox.x1 : ref_detail_bbox.x2,
@@ -571,6 +610,48 @@ class AutoMasker:
         y_off = (side - crop_h) // 2
         x_off = (side - crop_w) // 2
         canvas[y_off : y_off + crop_h, x_off : x_off + crop_w] = logo_crop
+
+        if abs(perspective_skew) >= 0.04:
+            x0, y0 = float(x_off), float(y_off)
+            x1, y1 = float(x_off + crop_w), float(y_off + crop_h)
+            src_pts = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+            s = abs(perspective_skew)
+            dx = crop_w * 0.35 * s
+            dy_top = crop_h * 0.75 * s
+            dy_bot = crop_h * 0.55 * s
+            dy_near = crop_h * 0.15 * s
+            if perspective_skew > 0:
+                dst_pts = np.array(
+                    [
+                        [x0, y0 - dy_near],
+                        [x1 - dx, y0 + dy_top],
+                        [x1 - dx, y1 - dy_bot],
+                        [x0, y1 + dy_near],
+                    ],
+                    dtype=np.float32,
+                )
+            else:
+                dst_pts = np.array(
+                    [
+                        [x0 + dx, y0 + dy_top],
+                        [x1, y0 - dy_near],
+                        [x1, y1 + dy_near],
+                        [x0 + dx, y1 - dy_bot],
+                    ],
+                    dtype=np.float32,
+                )
+            homography = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            canvas = np.asarray(
+                cv2.warpPerspective(
+                    canvas,
+                    homography,
+                    (side, side),
+                    flags=cv2.INTER_LANCZOS4,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=border_rgb,
+                ),
+                dtype=np.uint8,
+            )
 
         if target_size is not None:
             dst_w, dst_h = target_size

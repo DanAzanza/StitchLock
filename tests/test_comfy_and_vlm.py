@@ -31,7 +31,7 @@ from src.models import (
     load_pipeline_config,
 )
 from src.pipeline import GarmentCorrectionPipeline
-from src.vlm_heuristics import tighten_standalone_logo_box
+from src.vlm_heuristics import tighten_standalone_logo_box, tighten_target_graphic_box
 from src.vlm_inspector import (
     MAX_DEFECTS_PER_IMAGE,
     REFERENCE_CLASSIFICATION_PROMPT,
@@ -809,3 +809,33 @@ def test_reference_type_classification_and_logo_inspection_flow(
     )
     with pytest.raises(ComfyExecutionError, match="timeout"):
         real_cls_inspector._classify_reference_type("http://127.0.0.1:8000", big_logo, "pac")
+
+    # Loose VLM model_bbox_2d gets centered/tightened around actual graphic while keeping margin
+    skewed_vlm_box = NormalizedBox(0.18, 0.34, 0.65, 0.60)
+    tight_target = tighten_target_graphic_box(model_rgb, skewed_vlm_box)
+    assert abs(0.5 * (tight_target.x_min + tight_target.x_max) - (101.0 / 256.0)) < 0.03
+    assert tight_target.x_max < 0.56
+
+    # LOGO mode ignores bogus VLM ref_bbox_2d and uses foreground bounds from ref_rgb directly
+    bogus_ref_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Replace back graphic",
+            "defects": [
+                {
+                    "defect_summary": "Replace back graphic",
+                    "model_bbox_2d": [230, 380, 620, 560],
+                    "ref_bbox_2d": [450, 450, 550, 550],
+                    "edit_prompt": "Edit <image1>: Replace graphic with <image2>.",
+                }
+            ],
+        }
+    )
+    bogus_parsed = Qwen3VLInspector.parse_vlm_json_response(
+        raw_text=bogus_ref_json,
+        model_rgb=model_rgb,
+        ref_rgb=logo_rgb,
+        reference_type=ReferenceType.LOGO,
+    )
+    assert bogus_parsed.reference_detail_box.x_min <= 0.09
+    assert bogus_parsed.reference_detail_box.x_max >= 0.91

@@ -97,6 +97,51 @@ def tighten_standalone_logo_box(
     return NormalizedBox(round(nx1, 4), round(ny1, 4), round(nx2, 4), round(ny2, 4))
 
 
+def tighten_target_graphic_box(
+    model_rgb: NDArray[np.uint8],
+    vlm_box: NormalizedBox,
+    heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
+) -> NormalizedBox:
+    """Center and tighten a loose VLM target box around the salient garment graphic."""
+    h, w = model_rgb.shape[:2]
+    if h < 32 or w < 32:
+        return vlm_box
+    px = vlm_box.to_pixel_bbox(w, h)
+    patch = model_rgb[px.y1 : px.y2, px.x1 : px.x2].astype(np.float32)
+    if patch.shape[0] < 16 or patch.shape[1] < 16:
+        return vlm_box
+
+    bg_med = sample_studio_bg_rgb(model_rgb)
+    fg = compute_foreground_mask(patch, bg_med, heuristics.bg_color_distance_threshold)
+    if int(np.count_nonzero(fg)) < 100:
+        return vlm_box
+
+    cloth_med = np.median(patch[fg], axis=0)
+    diff_cloth = np.linalg.norm(patch - cloth_med.reshape(1, 1, 3), axis=2)
+    thr = max(45.0, float(np.percentile(diff_cloth[fg], 92)))
+    sal = (diff_cloth >= thr) & fg
+    ys, xs = np.where(sal)
+    if xs.size < 40 or ys.size < 40:
+        return vlm_box
+
+    gx1 = (px.x1 + int(xs.min())) / float(w)
+    gy1 = (px.y1 + int(ys.min())) / float(h)
+    gx2 = (px.x1 + int(xs.max()) + 1) / float(w)
+    gy2 = (px.y1 + int(ys.max()) + 1) / float(h)
+    gw = max(_MIN_BOX_SPAN_NORM, gx2 - gx1)
+    gh = max(_MIN_BOX_SPAN_NORM, gy2 - gy1)
+    pad_x = max(0.015, min(0.040, gw * 0.10))
+    pad_y = max(0.015, min(0.045, gh * 0.25))
+
+    nx1 = max(0.0, gx1 - pad_x)
+    ny1 = max(0.0, gy1 - pad_y)
+    nx2 = min(1.0, gx2 + pad_x)
+    ny2 = min(1.0, gy2 + pad_y)
+    if nx2 - nx1 < _MIN_BOX_SPAN_NORM or ny2 - ny1 < _MIN_BOX_SPAN_NORM:
+        return vlm_box
+    return NormalizedBox(round(nx1, 4), round(ny1, 4), round(nx2, 4), round(ny2, 4))
+
+
 def has_graphic_contrast(
     image_rgb: NDArray[np.uint8],
     box: NormalizedBox,

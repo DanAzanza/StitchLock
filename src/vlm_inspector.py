@@ -42,6 +42,7 @@ from src.vlm_heuristics import (
     split_misplaced_defect_if_shifted,
     tighten_ref_box_to_salient,
     tighten_standalone_logo_box,
+    tighten_target_graphic_box,
 )
 
 LOGGER = logging.getLogger("garment_fix.vlm_inspector")
@@ -119,32 +120,31 @@ REFERENCE_CLASSIFICATION_PROMPT = (
 
 LOGO_REFERENCE_INSPECTION_PROMPT = (
     "Image 1 is an On-Model garment photo. Image 2 is a standalone replacement LOGO graphic "
-    "(not a garment photo).\n"
+    "(the entire foreground graphic in Image 2 is the replacement logo).\n"
     "Locate the ONE primary/main logo, wordmark, or graphic on the main body (back or "
-    "chest/front) of the garment in Image 1 that should be replaced by the standalone logo "
-    "in Image 2.\n"
+    "chest/front) of the garment in Image 1 that should be replaced by the logo in Image 2.\n"
     "Rules:\n"
     "1. Choose the single most prominent central/primary logo or text graphic on the main body "
     "(back or chest/front) of the garment in Image 1. IGNORE secondary smaller sleeve patches, "
     "shoulder badges, or sleeve stripes unless no main body graphic exists.\n"
     '2. Emit exactly ONE entry in "defects" with "has_defect": true (emit "has_defect": false '
     "ONLY if the exact logo from Image 2 is already accurately printed on Image 1).\n"
-    "3. Provide two INDEPENDENT 2D bounding boxes [xmin, ymin, xmax, ymax] (scale 0 to 1000):\n"
-    "   - model_bbox_2d: TIGHT box enclosing ONLY the primary target graphic to replace inside the "
-    "garment silhouette in Image 1 (never include unrelated sleeve graphics, stripes, hair, "
-    "or skin).\n"
-    "   - ref_bbox_2d: TIGHT box enclosing the entire standalone logo graphic in Image 2 "
-    "(measured in Image 2 pixel space).\n"
+    "3. Provide model_bbox_2d [xmin, ymin, xmax, ymax] (scale 0 to 1000): a TIGHT box "
+    "enclosing ONLY the existing primary target graphic on the garment in Image 1 so the "
+    "replacement stays centered on that exact spot (never include empty side panels, "
+    "unrelated sleeve graphics, stripes, hair, or skin).\n"
     "4. Write ONE direct imperative edit_prompt:\n"
     '   "Edit <image1>: Replace ONLY <the target graphic/wordmark on the garment in Image 1> '
-    "with the exact <logo text, emblem shapes, and colors from Image 2>, preserving the exact "
-    "aspect ratio, lettering, colors, and details of <image2>, printed naturally onto the garment "
-    "fabric with realistic folds and lighting, keeping the garment color, hood, and all other "
-    'graphics completely unchanged, without copying any background rectangle from <image2>."\n'
+    "with the exact <logo text, emblem shapes, and colors from Image 2>, centered at the exact "
+    "position of the old graphic and warped in 3D perspective to match the angled surface, "
+    "curvature, and foreshortening of the garment back/front (tapering naturally toward the "
+    "receding edge), with realistic matte screen-print texture, fabric grain, folds, and "
+    "shadows matching the garment's existing prints, keeping the garment color, hood, and all "
+    "other graphics completely unchanged, without copying any background rectangle from "
+    '<image2>."\n'
     "Respond ONLY with valid JSON:\n"
     '{"has_defect": true, "defect_summary": "...", "defects": ['
     '{"defect_summary": "...", "model_bbox_2d": [xmin, ymin, xmax, ymax], '
-    '"ref_bbox_2d": [xmin, ymin, xmax, ymax], '
     '"edit_prompt": "Edit <image1>: Replace ONLY ..."}]}'
 )
 
@@ -616,20 +616,22 @@ class Qwen3VLInspector:
         reference_type: ReferenceType = ReferenceType.GARMENT,
     ) -> DefectTarget:
         raw_m_box = entry.get("model_bbox_2d") or entry.get("model_bbox_1000")
-        raw_r_box = entry.get("ref_bbox_2d") or entry.get("ref_bbox_1000")
-
         m_box = cls._parse_box_1000(raw_m_box, fallback_model_box)
-        r_box = cls._parse_box_1000(raw_r_box, fallback_ref_box)
 
-        m_box = cls._refine_connected_graphic_box(
-            model_rgb, m_box, fallback_model_box, heuristics=heuristics
-        )
-        if fallback_ref_box is not None:
-            r_box = fallback_ref_box
-        elif reference_type == ReferenceType.LOGO:
-            r_box = tighten_standalone_logo_box(ref_rgb, r_box, heuristics=heuristics)
-        elif has_graphic_contrast(ref_rgb, r_box, heuristics=heuristics):
-            r_box = tighten_ref_box_to_salient(ref_rgb, r_box, heuristics=heuristics)
+        if reference_type == ReferenceType.LOGO:
+            if fallback_model_box is None:
+                m_box = tighten_target_graphic_box(model_rgb, m_box, heuristics=heuristics)
+            r_box = fallback_ref_box or tighten_standalone_logo_box(ref_rgb, heuristics=heuristics)
+        else:
+            raw_r_box = entry.get("ref_bbox_2d") or entry.get("ref_bbox_1000")
+            r_box = cls._parse_box_1000(raw_r_box, fallback_ref_box)
+            m_box = cls._refine_connected_graphic_box(
+                model_rgb, m_box, fallback_model_box, heuristics=heuristics
+            )
+            if fallback_ref_box is not None:
+                r_box = fallback_ref_box
+            elif has_graphic_contrast(ref_rgb, r_box, heuristics=heuristics):
+                r_box = tighten_ref_box_to_salient(ref_rgb, r_box, heuristics=heuristics)
 
         summary = str(entry.get("defect_summary") or default_summary).strip()
         prompt = cls._normalize_edit_prompt(str(entry.get("edit_prompt", "")), fallback_prompt)

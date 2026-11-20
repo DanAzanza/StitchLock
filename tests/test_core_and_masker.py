@@ -461,3 +461,26 @@ def test_standalone_logo_masker_and_transparent_png_handling(tmp_path: Path) -> 
     opaque_rgb = np.full((64, 64, 3), (33, 66, 99), dtype=np.uint8)
     opaque_out = convert_reference_image_to_rgb(Image.fromarray(opaque_rgb, mode="RGB"))
     assert np.array_equal(opaque_out, opaque_rgb)
+
+    # 3/4 pose perspective skew estimation & 2D homography warp direction
+    pose_model = np.full((400, 400, 3), 240, dtype=np.uint8)
+    pose_model[80:360, 100:280] = (15, 16, 20)  # Garment silhouette spanning x=100..280
+    left_back_skew = AutoMasker._estimate_garment_perspective_skew(
+        pose_model, PixelBBox(110, 160, 180, 210)
+    )
+    assert left_back_skew > 0.08
+    center_skew = AutoMasker._estimate_garment_perspective_skew(
+        pose_model, PixelBBox(155, 160, 225, 210)
+    )
+    assert center_skew == 0.0
+
+    warped_logo = AutoMasker._prepare_standalone_logo_reference(
+        ref_rgb=logo_ref,
+        ref_detail_bbox=PixelBBox(20, 150, 380, 250),
+        perspective_skew=0.18,
+    )
+    wy, wx = np.where(warped_logo[:, :, 0] > 180)
+    mid_x = warped_logo.shape[1] // 2
+    left_span = int(wy[wx < mid_x].max() - wy[wx < mid_x].min())
+    right_span = int(wy[wx >= mid_x].max() - wy[wx >= mid_x].min())
+    assert left_span > right_span
