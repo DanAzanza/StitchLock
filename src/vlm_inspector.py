@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import requests
 import websocket
@@ -31,6 +32,7 @@ from src.models import (
     DefectTarget,
     HeuristicConfig,
     NormalizedBox,
+    ReferenceType,
 )
 from src.vlm_heuristics import (
     detect_micro_emblem_defect,
@@ -39,6 +41,7 @@ from src.vlm_heuristics import (
     refine_connected_graphic_box,
     split_misplaced_defect_if_shifted,
     tighten_ref_box_to_salient,
+    tighten_standalone_logo_box,
 )
 
 LOGGER = logging.getLogger("garment_fix.vlm_inspector")
@@ -107,6 +110,58 @@ POST_CHECK_PROMPT = (
     'or {{"passed": false, "reason": "..."}}'
 )
 
+REFERENCE_CLASSIFICATION_PROMPT = (
+    "Look at Image 1. Is it a photo of a clothing garment or apparel item "
+    "(such as a shirt, hoodie, jacket, sweatshirt, dress, or pants), OR is it a standalone "
+    "logo, emblem, badge, or graphic artwork (with no clothing garment visible)?\n"
+    'Respond ONLY with valid JSON: {"reference_type": "garment"} or {"reference_type": "logo"}'
+)
+
+LOGO_REFERENCE_INSPECTION_PROMPT = (
+    "Image 1 is an On-Model garment photo. Image 2 is a standalone replacement LOGO graphic "
+    "(not a garment photo).\n"
+    "Locate the ONE primary/main logo, wordmark, or graphic on the main body (back or "
+    "chest/front) of the garment in Image 1 that should be replaced by the standalone logo "
+    "in Image 2.\n"
+    "Rules:\n"
+    "1. Choose the single most prominent central/primary logo or text graphic on the main body "
+    "(back or chest/front) of the garment in Image 1. IGNORE secondary smaller sleeve patches, "
+    "shoulder badges, or sleeve stripes unless no main body graphic exists.\n"
+    '2. Emit exactly ONE entry in "defects" with "has_defect": true (emit "has_defect": false '
+    "ONLY if the exact logo from Image 2 is already accurately printed on Image 1).\n"
+    "3. Provide two INDEPENDENT 2D bounding boxes [xmin, ymin, xmax, ymax] (scale 0 to 1000):\n"
+    "   - model_bbox_2d: TIGHT box enclosing ONLY the primary target graphic to replace inside the "
+    "garment silhouette in Image 1 (never include unrelated sleeve graphics, stripes, hair, "
+    "or skin).\n"
+    "   - ref_bbox_2d: TIGHT box enclosing the entire standalone logo graphic in Image 2 "
+    "(measured in Image 2 pixel space).\n"
+    "4. Write ONE direct imperative edit_prompt:\n"
+    '   "Edit <image1>: Replace ONLY <the target graphic/wordmark on the garment in Image 1> '
+    "with the exact <logo text, emblem shapes, and colors from Image 2>, preserving the exact "
+    "aspect ratio, lettering, colors, and details of <image2>, printed naturally onto the garment "
+    "fabric with realistic folds and lighting, keeping the garment color, hood, and all other "
+    'graphics completely unchanged, without copying any background rectangle from <image2>."\n'
+    "Respond ONLY with valid JSON:\n"
+    '{"has_defect": true, "defect_summary": "...", "defects": ['
+    '{"defect_summary": "...", "model_bbox_2d": [xmin, ymin, xmax, ymax], '
+    '"ref_bbox_2d": [xmin, ymin, xmax, ymax], '
+    '"edit_prompt": "Edit <image1>: Replace ONLY ..."}]}'
+)
+
+
+def _resize_for_vlm(image_rgb: NDArray[np.uint8], max_side: int = 1024) -> NDArray[np.uint8]:
+    """Downscale oversized images cleanly before VLM inspection to prevent ViT VRAM spikes."""
+    h, w = image_rgb.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return image_rgb
+    scale = max_side / float(longest)
+    new_w = max(32, int(round(w * scale)))
+    new_h = max(32, int(round(h * scale)))
+    return np.asarray(
+        cv2.resize(image_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA), dtype=np.uint8
+    )
+
 
 @dataclass(frozen=True)
 class VLMInspectionResult:
@@ -119,6 +174,7 @@ class VLMInspectionResult:
     edit_prompt: str
     inspector_source: str
     defects: tuple[DefectTarget, ...] = ()
+    reference_type: ReferenceType = ReferenceType.GARMENT
 
     @property
     def resolved_defects(self) -> tuple[DefectTarget, ...]:
@@ -156,6 +212,7 @@ class VLMInspectionResult:
             ],
             "edit_prompt": self.edit_prompt,
             "defects": [item.to_dict() for item in targets],
+            "reference_type": self.reference_type.value,
             "inspector_source": self.inspector_source,
         }
 
@@ -191,13 +248,19 @@ class Qwen3VLInspector:
                 "Recovery: Start the ComfyUI server and retry."
             )
 
-        raw_text = self._run_comfy_vlm(server_url, model_rgb, ref_rgb, case_id)
+        reference_type = self._classify_reference_type(server_url, ref_rgb, case_id)
+        raw_text = (
+            self._run_logo_vlm(server_url, model_rgb, ref_rgb, case_id)
+            if reference_type == ReferenceType.LOGO
+            else self._run_comfy_vlm(server_url, model_rgb, ref_rgb, case_id)
+        )
         parsed = self.parse_vlm_json_response(
             raw_text=raw_text,
             model_rgb=model_rgb,
             ref_rgb=ref_rgb,
             source_label=f"qwen3_vl_8b ({server_url})",
             heuristics=self._heuristics,
+            reference_type=reference_type,
         )
         if not parsed.has_defect:
             return parsed
@@ -205,7 +268,9 @@ class Qwen3VLInspector:
         refined_defects: list[DefectTarget] = []
         for idx, defect in enumerate(parsed.resolved_defects, start=1):
             ref_box = defect.reference_detail_box
-            if not self._is_erase_defect(defect.edit_prompt) and not has_graphic_contrast(
+            if reference_type == ReferenceType.LOGO:
+                ref_box = tighten_standalone_logo_box(ref_rgb, ref_box, heuristics=self._heuristics)
+            elif not self._is_erase_defect(defect.edit_prompt) and not has_graphic_contrast(
                 ref_rgb, ref_box, heuristics=self._heuristics
             ):
                 located = self._locate_ref_detail_single_image(
@@ -234,7 +299,77 @@ class Qwen3VLInspector:
             edit_prompt=primary.edit_prompt,
             inspector_source=parsed.inspector_source,
             defects=tuple(refined_defects),
+            reference_type=reference_type,
         )
+
+    @staticmethod
+    def parse_reference_type_json(raw_text: str) -> ReferenceType:
+        """Parse standalone-logo vs. full-garment reference classification safely."""
+        match = re.search(r"\{.*\}", raw_text.strip(), flags=re.DOTALL)
+        if not match:
+            LOGGER.warning("Missing JSON in reference classification output: %r", raw_text)
+            return ReferenceType.GARMENT
+        try:
+            data: Any = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("Malformed JSON in reference classification output: %s", exc)
+            return ReferenceType.GARMENT
+        if not isinstance(data, dict):
+            return ReferenceType.GARMENT
+        raw_type = str(data.get("reference_type", "")).strip().lower()
+        if raw_type == ReferenceType.LOGO.value:
+            return ReferenceType.LOGO
+        if raw_type == ReferenceType.GARMENT.value:
+            return ReferenceType.GARMENT
+        LOGGER.warning("Unknown reference_type %r; defaulting to 'garment'.", raw_type)
+        return ReferenceType.GARMENT
+
+    def _classify_reference_type(
+        self,
+        server_url: str,
+        ref_rgb: NDArray[np.uint8],
+        case_id: str,
+    ) -> ReferenceType:
+        """Classify whether Image 2 is a full garment photo or a standalone logo."""
+        run_token = uuid.uuid4().hex[:8]
+        r_scaled = _resize_for_vlm(ref_rgb, max_side=512)
+        r_name = upload_png_bytes(
+            server_url, f"vlm_cls_{case_id}_{run_token}.png", encode_png_rgb(r_scaled)
+        )
+        workflow = copy.deepcopy(self._workflow_template)
+        workflow.pop("2", None)
+        workflow["1"]["inputs"]["image"] = r_name
+        inputs_4 = workflow["4"]["inputs"]
+        inputs_4.pop("images.image2", None)
+        inputs_4["max_length"] = 48
+        inputs_4["prompt"] = REFERENCE_CLASSIFICATION_PROMPT
+        raw = self._execute_vlm_workflow(server_url, workflow, f"{case_id}_cls")
+        return self.parse_reference_type_json(raw)
+
+    def _run_dual_vlm(
+        self,
+        server_url: str,
+        model_rgb: NDArray[np.uint8],
+        ref_rgb: NDArray[np.uint8],
+        case_id: str,
+        prompt: str,
+    ) -> str:
+        """Upload VLM-sized image pair and execute TextGenerateV2 on Qwen3-VL-8B."""
+        run_token = uuid.uuid4().hex[:8]
+        m_scaled = _resize_for_vlm(model_rgb, max_side=1024)
+        r_scaled = _resize_for_vlm(ref_rgb, max_side=1024)
+        m_name = upload_png_bytes(
+            server_url, f"vlm_model_{case_id}_{run_token}.png", encode_png_rgb(m_scaled)
+        )
+        r_name = upload_png_bytes(
+            server_url, f"vlm_ref_{case_id}_{run_token}.png", encode_png_rgb(r_scaled)
+        )
+
+        workflow = copy.deepcopy(self._workflow_template)
+        workflow["1"]["inputs"]["image"] = m_name
+        workflow["2"]["inputs"]["image"] = r_name
+        workflow["4"]["inputs"]["prompt"] = prompt
+        return self._execute_vlm_workflow(server_url, workflow, case_id)
 
     def _run_comfy_vlm(
         self,
@@ -243,20 +378,22 @@ class Qwen3VLInspector:
         ref_rgb: NDArray[np.uint8],
         case_id: str,
     ) -> str:
-        """Upload full-res pair and execute TextGenerateV2 on Qwen3-VL-8B."""
-        run_token = uuid.uuid4().hex[:8]
-        m_name = upload_png_bytes(
-            server_url, f"vlm_model_{case_id}_{run_token}.png", encode_png_rgb(model_rgb)
-        )
-        r_name = upload_png_bytes(
-            server_url, f"vlm_ref_{case_id}_{run_token}.png", encode_png_rgb(ref_rgb)
+        """Upload garment pair and execute standard garment defect inspection."""
+        return self._run_dual_vlm(
+            server_url, model_rgb, ref_rgb, case_id, DEFAULT_INSPECTION_PROMPT
         )
 
-        workflow = copy.deepcopy(self._workflow_template)
-        workflow["1"]["inputs"]["image"] = m_name
-        workflow["2"]["inputs"]["image"] = r_name
-        workflow["4"]["inputs"]["prompt"] = DEFAULT_INSPECTION_PROMPT
-        return self._execute_vlm_workflow(server_url, workflow, case_id)
+    def _run_logo_vlm(
+        self,
+        server_url: str,
+        model_rgb: NDArray[np.uint8],
+        ref_rgb: NDArray[np.uint8],
+        case_id: str,
+    ) -> str:
+        """Upload garment + standalone logo and localize primary replacement target."""
+        return self._run_dual_vlm(
+            server_url, model_rgb, ref_rgb, case_id, LOGO_REFERENCE_INSPECTION_PROMPT
+        )
 
     def _locate_ref_detail_single_image(
         self,
@@ -268,8 +405,9 @@ class Qwen3VLInspector:
         """Locate graphic inside Image 2 solo when dual-view ref_box points at plain fabric."""
         run_token = uuid.uuid4().hex[:8]
         try:
+            r_scaled = _resize_for_vlm(ref_rgb, max_side=1024)
             r_name = upload_png_bytes(
-                server_url, f"vlm_ref_solo_{case_id}_{run_token}.png", encode_png_rgb(ref_rgb)
+                server_url, f"vlm_ref_solo_{case_id}_{run_token}.png", encode_png_rgb(r_scaled)
             )
             workflow = copy.deepcopy(self._workflow_template)
             workflow.pop("2", None)
@@ -347,10 +485,14 @@ class Qwen3VLInspector:
             )
         run_token = uuid.uuid4().hex[:8]
         m_name = upload_png_bytes(
-            server_url, f"vlm_post_rep_{case_id}_{run_token}.png", encode_png_rgb(repaired_rgb)
+            server_url,
+            f"vlm_post_rep_{case_id}_{run_token}.png",
+            encode_png_rgb(_resize_for_vlm(repaired_rgb, max_side=1024)),
         )
         r_name = upload_png_bytes(
-            server_url, f"vlm_post_ref_{case_id}_{run_token}.png", encode_png_rgb(ref_rgb)
+            server_url,
+            f"vlm_post_ref_{case_id}_{run_token}.png",
+            encode_png_rgb(_resize_for_vlm(ref_rgb, max_side=1024)),
         )
         workflow = copy.deepcopy(self._workflow_template)
         workflow["1"]["inputs"]["image"] = m_name
@@ -370,6 +512,7 @@ class Qwen3VLInspector:
         fallback_prompt: str | None = None,
         source_label: str = "qwen3_vl_8b",
         heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
+        reference_type: ReferenceType = ReferenceType.GARMENT,
     ) -> VLMInspectionResult:
         """Parse multi-defect or single-defect Qwen3-VL JSON and refine target boxes."""
         cleaned = raw_text.strip()
@@ -383,11 +526,12 @@ class Qwen3VLInspector:
 
         raw_entries = cls._extract_raw_defect_entries(data)
         if not has_defect or not raw_entries:
-            micro = cls._detect_micro_emblem_defect(
-                model_rgb, ref_rgb, source_label, heuristics=heuristics
-            )
-            if micro is not None:
-                return micro
+            if reference_type == ReferenceType.GARMENT:
+                micro = cls._detect_micro_emblem_defect(
+                    model_rgb, ref_rgb, source_label, heuristics=heuristics
+                )
+                if micro is not None:
+                    return micro
             empty_box = fallback_model_box or NormalizedBox(0.30, 0.30, 0.70, 0.70)
             empty_ref = fallback_ref_box or NormalizedBox(0.30, 0.30, 0.70, 0.70)
             return VLMInspectionResult(
@@ -398,6 +542,7 @@ class Qwen3VLInspector:
                 edit_prompt=fallback_prompt or "",
                 inspector_source=source_label,
                 defects=(),
+                reference_type=reference_type,
             )
 
         parsed_defects = [
@@ -410,11 +555,16 @@ class Qwen3VLInspector:
                 fallback_ref_box=fallback_ref_box if idx == 0 else None,
                 fallback_prompt=fallback_prompt if idx == 0 else None,
                 heuristics=heuristics,
+                reference_type=reference_type,
             )
             for idx, entry in enumerate(raw_entries[: MAX_DEFECTS_PER_IMAGE * 2])
         ]
         deduped = cls._merge_overlapping_defects(parsed_defects)
-        if len(deduped) == 1 and not cls._is_erase_defect(deduped[0].edit_prompt):
+        if (
+            reference_type == ReferenceType.GARMENT
+            and len(deduped) == 1
+            and not cls._is_erase_defect(deduped[0].edit_prompt)
+        ):
             deduped = cls._split_misplaced_defect_if_shifted(
                 model_rgb, ref_rgb, deduped, heuristics=heuristics
             )
@@ -438,6 +588,7 @@ class Qwen3VLInspector:
             edit_prompt=primary.edit_prompt,
             inspector_source=source_label,
             defects=tuple(ordered),
+            reference_type=reference_type,
         )
 
     @staticmethod
@@ -462,6 +613,7 @@ class Qwen3VLInspector:
         fallback_ref_box: NormalizedBox | None,
         fallback_prompt: str | None,
         heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
+        reference_type: ReferenceType = ReferenceType.GARMENT,
     ) -> DefectTarget:
         raw_m_box = entry.get("model_bbox_2d") or entry.get("model_bbox_1000")
         raw_r_box = entry.get("ref_bbox_2d") or entry.get("ref_bbox_1000")
@@ -474,6 +626,8 @@ class Qwen3VLInspector:
         )
         if fallback_ref_box is not None:
             r_box = fallback_ref_box
+        elif reference_type == ReferenceType.LOGO:
+            r_box = tighten_standalone_logo_box(ref_rgb, r_box, heuristics=heuristics)
         elif has_graphic_contrast(ref_rgb, r_box, heuristics=heuristics):
             r_box = tighten_ref_box_to_salient(ref_rgb, r_box, heuristics=heuristics)
 

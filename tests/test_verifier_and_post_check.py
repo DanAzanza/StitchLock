@@ -20,6 +20,7 @@ from src.models import (
     NormalizedBox,
     PipelineConfig,
     PixelBBox,
+    ReferenceType,
     VerificationConfig,
     VerificationMetrics,
     load_pipeline_config,
@@ -155,6 +156,15 @@ class _ScriptedPostCheckInspector(Qwen3VLInspector):
         super().__init__(comfy_config, workflow_path)
         self.post_json = post_json
         self.post_check_calls = 0
+
+    def _classify_reference_type(
+        self,
+        server_url: str,
+        ref_rgb: NDArray[np.uint8],
+        case_id: str,
+    ) -> ReferenceType:
+        _ = (server_url, ref_rgb, case_id)
+        return ReferenceType.GARMENT
 
     def _run_comfy_vlm(
         self,

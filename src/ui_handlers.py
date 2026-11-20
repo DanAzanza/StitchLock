@@ -32,6 +32,7 @@ from src.models import (
 from src.pipeline import (
     REPORTS_SUBDIR,
     GarmentCorrectionPipeline,
+    convert_reference_image_to_rgb,
     diff_heatmap_filename,
     save_rgb_atomic,
 )
@@ -43,6 +44,7 @@ from src.ui_custom_handlers import (
     VIEW_HEATMAP,
     ImageInput,
     coerce_image_and_stem,
+    coerce_reference_image_and_stem,
     detect_custom_ui,
     ensure_environment_ready,
     preview_custom_boxes_ui,
@@ -74,6 +76,7 @@ __all__ = [
     "is_case_repaired",
     "load_single_case_view_ui",
     "preview_custom_boxes_ui",
+    "read_reference_rgb_optional",
     "read_rgb_optional",
     "render_box_overlay",
     "render_multi_box_overlay",
@@ -139,6 +142,14 @@ def read_rgb_optional(path: Path) -> NDArray[np.uint8] | None:
         return None
     with Image.open(path) as im:
         return np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+
+def read_reference_rgb_optional(path: Path) -> NDArray[np.uint8] | None:
+    """Read an optional reference image as RGB, matting transparent logo PNGs safely."""
+    if not path.is_file():
+        return None
+    with Image.open(path) as im:
+        return convert_reference_image_to_rgb(im)
 
 
 def slider_pair(
@@ -216,7 +227,9 @@ def load_single_case_view_ui(
     case_root = case_path if case_path.is_dir() else case_path.parent
 
     orig_rgb = read_rgb_optional(resolve_safe_path(case_root, manifest.model_image_filename))
-    ref_rgb = read_rgb_optional(resolve_safe_path(case_root, manifest.reference_image_filename))
+    ref_rgb = read_reference_rgb_optional(
+        resolve_safe_path(case_root, manifest.reference_image_filename)
+    )
 
     reports_dir = resolve_safe_path(cfg.outputs_dir, REPORTS_SUBDIR)
     final_rgb = read_rgb_optional(resolve_safe_path(cfg.outputs_dir, f"{manifest.case_id}.png"))
@@ -322,7 +335,7 @@ def add_pair_to_inbox(
 ) -> str:
     """Persist an uploaded (Model Photo, Product Reference) pair directly into `test_cases/`."""
     model_rgb, model_stem = coerce_image_and_stem(model_img, "uploaded_look")
-    ref_rgb, _ = coerce_image_and_stem(ref_img, "uploaded_ref")
+    ref_rgb, _ = coerce_reference_image_and_stem(ref_img, "uploaded_ref")
     if model_rgb is None or ref_rgb is None:
         raise PipelineError("Please upload both a Model Photo and a Product Reference.")
 

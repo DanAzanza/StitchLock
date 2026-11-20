@@ -149,7 +149,7 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
                 with gr.Column(scale=1, min_width=120):
                     out_ref = gr.Image(
                         value=init_ref,
-                        label="Product Reference",
+                        label="Product / Logo Reference",
                         type="numpy",
                         height=225,
                         buttons=["fullscreen"],
@@ -206,7 +206,7 @@ def _build_studio_tab(gr: Any, ui_guard: Callable[..., Any]) -> None:
             close_modal_btn = gr.Button("✕", size="sm", scale=0, min_width=40)
         with gr.Row():
             modal_model_in = gr.Image(label="Model Photo", type="filepath", height=280)
-            modal_ref_in = gr.Image(label="Product Reference", type="filepath", height=280)
+            modal_ref_in = gr.Image(label="Product / Logo Reference", type="filepath", height=280)
 
     def _toggle_compare_view(mode: str) -> tuple[Any, Any]:
         show_heatmap = mode == VIEW_HEATMAP

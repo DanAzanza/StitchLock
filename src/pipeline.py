@@ -42,6 +42,23 @@ REPORTS_SUBDIR = "_reports"
 LOGGER = logging.getLogger("garment_fix.pipeline")
 
 
+def convert_reference_image_to_rgb(img: Image.Image) -> NDArray[np.uint8]:
+    """Convert reference image to uint8 RGB, matting transparent logos on contrasting neutral."""
+    has_alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
+    if not has_alpha:
+        return np.asarray(img.convert("RGB"), dtype=np.uint8)
+    rgba = np.asarray(img.convert("RGBA"), dtype=np.uint8)
+    alpha = rgba[:, :, 3]
+    if float(np.mean(alpha < 16)) < 0.05 or not bool(np.any(alpha >= 128)):
+        return rgba[:, :, :3].copy()
+    opaque_rgb = rgba[alpha >= 128, :3].astype(np.float32)
+    mean_luma = float(np.mean(opaque_rgb @ np.array([0.299, 0.587, 0.114], dtype=np.float32)))
+    bg_val = 245.0 if mean_luma < 128.0 else 18.0
+    alpha_f = (alpha.astype(np.float32) / 255.0)[..., None]
+    blended = rgba[:, :, :3].astype(np.float32) * alpha_f + bg_val * (1.0 - alpha_f)
+    return np.clip(np.round(blended), 0, 255).astype(np.uint8)
+
+
 def extract_padded_roi(
     image_rgb: NDArray[np.uint8], bbox: PixelBBox, pad_ratio: float = 0.08
 ) -> NDArray[np.uint8]:
@@ -381,7 +398,7 @@ class GarmentCorrectionPipeline:
         ref_path = resolve_safe_path(case_root, manifest.reference_image_filename)
 
         original_model_rgb, model_alpha, model_icc = self._load_rgb_with_metadata(model_path)
-        reference_product_rgb = self._load_rgb(ref_path)
+        reference_product_rgb = self._load_reference_rgb(ref_path)
 
         # Stage 0: Qwen3-VL-8B Automated Defect Inspection (when auto_vision strategy active)
         vlm_result: VLMInspectionResult | None = None
@@ -415,6 +432,7 @@ class GarmentCorrectionPipeline:
                 model_target_box=vlm_result.model_target_box,
                 reference_detail_box=vlm_result.reference_detail_box,
                 prompt=vlm_result.edit_prompt or manifest.prompt,
+                reference_type=vlm_result.reference_type,
             )
         else:
             if (
@@ -692,3 +710,10 @@ class GarmentCorrectionPipeline:
     @classmethod
     def _load_rgb(cls, path: Path) -> NDArray[np.uint8]:
         return cls._load_rgb_with_metadata(path)[0]
+
+    @staticmethod
+    def _load_reference_rgb(path: Path) -> NDArray[np.uint8]:
+        if not path.is_file():
+            raise ConfigurationError(f"Image file not found: {path}")
+        with Image.open(path) as img:
+            return convert_reference_image_to_rgb(img)

@@ -44,6 +44,59 @@ def sample_studio_bg_rgb(image_rgb: NDArray[np.uint8]) -> NDArray[np.float32]:
     return np.asarray(np.median(corners.astype(np.float32), axis=0), dtype=np.float32)
 
 
+def sample_four_corner_bg_rgb(image_rgb: NDArray[np.uint8]) -> NDArray[np.float32]:
+    """Estimate uniform backdrop RGB from all four outer corners of an image."""
+    h, w = image_rgb.shape[:2]
+    c_w = max(4, w // 20)
+    c_h = max(4, h // 20)
+    corners = np.concatenate(
+        [
+            image_rgb[0:c_h, 0:c_w, :].reshape(-1, 3),
+            image_rgb[0:c_h, w - c_w : w, :].reshape(-1, 3),
+            image_rgb[h - c_h : h, 0:c_w, :].reshape(-1, 3),
+            image_rgb[h - c_h : h, w - c_w : w, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    return np.asarray(np.median(corners.astype(np.float32), axis=0), dtype=np.float32)
+
+
+def tighten_standalone_logo_box(
+    ref_rgb: NDArray[np.uint8],
+    fallback_box: NormalizedBox | None = None,
+    heuristics: HeuristicConfig = _DEFAULT_HEURISTICS,
+) -> NormalizedBox:
+    """Locate tight bounds of a standalone logo/graphic against its 4-corner backdrop."""
+    h, w = ref_rgb.shape[:2]
+    default_box = fallback_box or NormalizedBox(0.02, 0.02, 0.98, 0.98)
+    if h < 16 or w < 16:
+        return default_box
+
+    bg_med = sample_four_corner_bg_rgb(ref_rgb)
+    diff_bg = np.linalg.norm(ref_rgb.astype(np.float32) - bg_med.reshape(1, 1, 3), axis=2)
+    thr = max(18.0, heuristics.bg_color_distance_threshold - 4.0)
+    ys, xs = np.where(diff_bg > thr)
+    if xs.size < 25 or ys.size < 25:
+        return default_box
+
+    pad_x = max(2, int(round(w * 0.015)))
+    pad_y = max(2, int(round(h * 0.015)))
+    nx1 = max(0.0, (int(xs.min()) - pad_x) / float(w))
+    ny1 = max(0.0, (int(ys.min()) - pad_y) / float(h))
+    nx2 = min(1.0, (int(xs.max()) + 1 + pad_x) / float(w))
+    ny2 = min(1.0, (int(ys.max()) + 1 + pad_y) / float(h))
+
+    if nx2 - nx1 < _MIN_BOX_SPAN_NORM:
+        nx2 = min(1.0, nx1 + _MIN_BOX_SPAN_NORM)
+        if nx2 - nx1 < _MIN_BOX_SPAN_NORM:
+            nx1 = max(0.0, nx2 - _MIN_BOX_SPAN_NORM)
+    if ny2 - ny1 < _MIN_BOX_SPAN_NORM:
+        ny2 = min(1.0, ny1 + _MIN_BOX_SPAN_NORM)
+        if ny2 - ny1 < _MIN_BOX_SPAN_NORM:
+            ny1 = max(0.0, ny2 - _MIN_BOX_SPAN_NORM)
+    return NormalizedBox(round(nx1, 4), round(ny1, 4), round(nx2, 4), round(ny2, 4))
+
+
 def has_graphic_contrast(
     image_rgb: NDArray[np.uint8],
     box: NormalizedBox,
@@ -418,7 +471,7 @@ def split_misplaced_defect_if_shifted(
     return [erase_target, insert_target]
 
 
-def _compute_foreground_mask(
+def compute_foreground_mask(
     patch: NDArray[np.float32], bg_med: NDArray[np.float32], bg_thr: float
 ) -> NDArray[np.bool_]:
     """Exclude only border-connected backdrop components so interior white logos stay foreground."""
@@ -429,6 +482,9 @@ def _compute_foreground_mask(
     if not border_labels:
         return np.ones(patch.shape[:2], dtype=np.bool_)
     return ~np.isin(labels, border_labels)
+
+
+_compute_foreground_mask = compute_foreground_mask
 
 
 def find_salient_emblem_box(

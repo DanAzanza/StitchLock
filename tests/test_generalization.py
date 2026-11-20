@@ -22,6 +22,7 @@ from src.models import (
     MaskingStrategy,
     PipelineConfig,
     PixelBBox,
+    ReferenceType,
     VerificationConfig,
     load_pipeline_config,
 )
@@ -61,6 +62,15 @@ class _ScriptedHoldoutInspector(Qwen3VLInspector):
     ) -> None:
         super().__init__(comfy_config, workflow_path)
         self._specs = specs_by_id
+
+    def _classify_reference_type(
+        self,
+        server_url: str,
+        ref_rgb: NDArray[np.uint8],
+        case_id: str,
+    ) -> ReferenceType:
+        _ = (server_url, ref_rgb, case_id)
+        return ReferenceType.GARMENT
 
     def _run_comfy_vlm(
         self,

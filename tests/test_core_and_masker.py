@@ -26,10 +26,11 @@ from src.models import (
     NormalizedBox,
     PipelineConfig,
     PixelBBox,
+    ReferenceType,
     load_pipeline_config,
     resolve_safe_path,
 )
-from src.pipeline import GarmentCorrectionPipeline
+from src.pipeline import GarmentCorrectionPipeline, convert_reference_image_to_rgb
 from src.vlm_inspector import Qwen3VLInspector, VLMInspectionResult
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -365,3 +366,98 @@ def test_rgba_alpha_and_icc_profile_preservation_roundtrip(tmp_path: Path) -> No
     with Image.open(gray_artifact.corrected_image_path) as gray_out:
         assert gray_out.mode == "RGB"
         assert gray_out.info.get("icc_profile") is None
+
+
+def test_standalone_logo_masker_and_transparent_png_handling(tmp_path: Path) -> None:
+    setup_all_test_cases(tmp_path)
+    base_manifest = load_case_manifest(tmp_path / "test_cases" / "case_01_kova_zip_jacket.png")
+    masker = AutoMasker(MaskingConfig(strategy=MaskingStrategy.AUTO_VISION))
+
+    # Dark hoodie on light studio backdrop with graphic close to left garment edge
+    model_rgb = np.full((600, 600, 3), 240, dtype=np.uint8)
+    model_rgb[120:540, 165:400] = (15, 16, 20)
+    model_rgb[250:300, 172:285] = (230, 50, 130)
+
+    # Wide standalone PAC-MAN style logo (spans almost full width on pure black)
+    logo_ref = np.zeros((400, 400, 3), dtype=np.uint8)
+    logo_ref[150:250, 20:380] = (245, 205, 60)
+
+    logo_manifest = replace(
+        base_manifest,
+        model_target_box=NormalizedBox(0.28, 0.41, 0.48, 0.50),
+        reference_detail_box=NormalizedBox(0.04, 0.36, 0.96, 0.64),
+        reference_type=ReferenceType.LOGO,
+        prompt="Edit <image1>: Replace back wordmark with <image2>.",
+    )
+    loc = masker.localize_and_mask(model_rgb, logo_ref, logo_manifest)
+    # Studio backdrop left of x=165 must remain unmasked (binary_mask == 0 and feathered_mask == 0)
+    assert np.all(loc.binary_mask[:, :164] == 0)
+    assert np.all(loc.feathered_mask[loc.binary_mask == 0] == 0.0)
+    assert np.count_nonzero(loc.binary_mask[250:300, 172:285]) > 100
+    # Prepared logo reference stays centered and unclipped on both left & right sides
+    prep = loc.cropped_product_ref
+    assert prep.shape[0] == prep.shape[1]
+    assert np.all(prep[:, :15] == 0)
+    assert np.all(prep[:, -15:] == 0)
+    assert int(np.max(prep[:, prep.shape[1] // 2])) > 180
+
+    # Micro target with LOGO reference also keeps full centered logo (not a middle slice)
+    micro_logo_manifest = replace(
+        logo_manifest,
+        model_target_box=NormalizedBox(0.45, 0.35, 0.50, 0.40),
+        reference_detail_box=NormalizedBox(0.04, 0.36, 0.96, 0.64),
+    )
+    micro_loc = masker.localize_and_mask(model_rgb, logo_ref, micro_logo_manifest)
+    assert micro_loc.context_bbox.width == 192
+    assert np.all(micro_loc.cropped_product_ref[:, :8] == 0)
+    assert np.all(micro_loc.cropped_product_ref[:, -8:] == 0)
+
+    # Negative/boundary: uniform, white-on-light, and near-backdrop garments must NOT clip interiors
+    uniform = np.full((256, 256, 3), 240, dtype=np.uint8)
+    u_mask, _ = masker._build_masks(
+        uniform, PixelBBox(60, 60, 140, 140), dilation_px=8, feather_sigma=3.0
+    )
+    assert int(np.count_nonzero(u_mask)) == 96 * 96
+
+    white_on_light = np.full((320, 320, 3), 235, dtype=np.uint8)
+    white_on_light[40:310, 60:260] = (245, 245, 245)  # White tee on light studio backdrop
+    white_on_light[120:155, 110:210] = (30, 30, 30)  # Dark wordmark inside white chest
+    wol_mask, wol_feather = masker._build_masks(
+        white_on_light, PixelBBox(105, 115, 215, 160), dilation_px=6, feather_sigma=2.0
+    )
+    assert int(np.count_nonzero(wol_mask)) == 122 * 57
+    assert float(np.min(wol_feather[120:155, 110:210])) > 0.5
+
+    cream_on_light = np.full((320, 320, 3), (233, 233, 228), dtype=np.uint8)
+    cream_on_light[40:310, 50:270] = (231, 229, 222)  # Cream cotton touching corner tolerance
+    cream_on_light[120:155, 110:210] = (35, 55, 45)
+    cream_mask, _ = masker._build_masks(
+        cream_on_light, PixelBBox(105, 115, 215, 160), dilation_px=6, feather_sigma=2.0
+    )
+    assert int(np.count_nonzero(cream_mask)) == 122 * 57
+
+    real_cream = ROOT_DIR / "test_cases" / "cream_crewneck.png"
+    if real_cream.is_file():
+        with Image.open(real_cream) as cream_im:
+            cream_arr = np.asarray(cream_im.convert("RGB"), dtype=np.uint8)
+        rc_mask, _ = masker._build_masks(
+            cream_arr, PixelBBox(540, 388, 642, 472), dilation_px=0, feather_sigma=2.0
+        )
+        assert int(np.count_nonzero(rc_mask[388:472, 540:642])) == (642 - 540) * (472 - 388)
+
+    # Transparent PNG logos composite onto contrasting neutral; opaque images pass unchanged
+    dark_rgba = np.zeros((100, 100, 4), dtype=np.uint8)
+    dark_rgba[30:70, 20:80, :3] = (15, 20, 25)
+    dark_rgba[30:70, 20:80, 3] = 255
+    dark_comp = convert_reference_image_to_rgb(Image.fromarray(dark_rgba, mode="RGBA"))
+    assert int(dark_comp[0, 0, 0]) == 245
+
+    light_rgba = np.zeros((100, 100, 4), dtype=np.uint8)
+    light_rgba[30:70, 20:80, :3] = (245, 220, 80)
+    light_rgba[30:70, 20:80, 3] = 255
+    light_comp = convert_reference_image_to_rgb(Image.fromarray(light_rgba, mode="RGBA"))
+    assert int(light_comp[0, 0, 0]) == 18
+
+    opaque_rgb = np.full((64, 64, 3), (33, 66, 99), dtype=np.uint8)
+    opaque_out = convert_reference_image_to_rgb(Image.fromarray(opaque_rgb, mode="RGB"))
+    assert np.array_equal(opaque_out, opaque_rgb)

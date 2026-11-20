@@ -25,12 +25,14 @@ from src.models import (
     NormalizedBox,
     PipelineConfig,
     PipelineError,
+    ReferenceType,
     VerificationMetrics,
     load_pipeline_config,
 )
 from src.pipeline import (
     GarmentCorrectionPipeline,
     LocalizationResult,
+    convert_reference_image_to_rgb,
     diff_heatmap_filename,
     execute_multi_defect_restoration,
     extract_reference_detail_crop,
@@ -57,6 +59,11 @@ def ensure_environment_ready() -> GarmentCorrectionPipeline:
     return GarmentCorrectionPipeline(config)
 
 
+def _resolve_clean_stem(path: Path, fallback_stem: str) -> str:
+    clean_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._")
+    return clean_stem or fallback_stem
+
+
 def coerce_image_and_stem(
     image_input: ImageInput,
     fallback_stem: str,
@@ -71,8 +78,24 @@ def coerce_image_and_stem(
         return None, fallback_stem
     with Image.open(path) as im:
         rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
-    clean_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._")
-    return rgb, (clean_stem or fallback_stem)
+    return rgb, _resolve_clean_stem(path, fallback_stem)
+
+
+def coerce_reference_image_and_stem(
+    image_input: ImageInput,
+    fallback_stem: str,
+) -> tuple[NDArray[np.uint8] | None, str]:
+    """Load reference filepath or numpy image into RGB, matting transparent logo assets."""
+    if image_input is None:
+        return None, fallback_stem
+    if isinstance(image_input, np.ndarray):
+        return image_input, fallback_stem
+    path = Path(image_input)
+    if not path.is_file():
+        return None, fallback_stem
+    with Image.open(path) as im:
+        rgb = convert_reference_image_to_rgb(im)
+    return rgb, _resolve_clean_stem(path, fallback_stem)
 
 
 def render_multi_box_overlay(
@@ -137,7 +160,7 @@ def preview_custom_boxes_ui(
 ) -> tuple[NDArray[np.uint8] | None, NDArray[np.uint8] | None]:
     """Update both bounding-box preview images whenever sliders or uploads change."""
     model_img, _ = coerce_image_and_stem(model_input, "custom_model")
-    ref_img, _ = coerce_image_and_stem(ref_input, "custom_ref")
+    ref_img, _ = coerce_reference_image_and_stem(ref_input, "custom_ref")
     model_preview = render_box_overlay(
         model_img, m_xmin, m_ymin, m_xmax, m_ymax, (255, 65, 65), "TARGET MASK ROI"
     )
@@ -203,7 +226,7 @@ def detect_custom_ui(
 ]:
     """Run Qwen3-VL auto-detection on uploaded images to inspect detected regions."""
     model_rgb, _ = coerce_image_and_stem(model_img, "custom_model")
-    ref_rgb, _ = coerce_image_and_stem(ref_img, "custom_ref")
+    ref_rgb, _ = coerce_reference_image_and_stem(ref_img, "custom_ref")
     if model_rgb is None or ref_rgb is None:
         raise PipelineError("Please upload both a Model Photo and a Product Reference.")
 
@@ -385,7 +408,7 @@ def run_custom_upload_ui(
     """Execute live ComfyUI correction on an uploaded pair and save outputs to `outputs/`."""
     default_stem = f"custom_upload_{time.strftime('%Y%m%d_%H%M%S')}"
     model_rgb, output_stem = coerce_image_and_stem(model_img, default_stem)
-    ref_rgb, _ = coerce_image_and_stem(ref_img, f"{output_stem}_reference")
+    ref_rgb, _ = coerce_reference_image_and_stem(ref_img, f"{output_stem}_reference")
     if model_rgb is None or ref_rgb is None:
         raise PipelineError("Please upload both a Model Photo and a Product Reference.")
 
@@ -457,6 +480,9 @@ def run_custom_upload_ui(
         reference_image_filename=f"{output_stem}_reference.png",
         model_target_box=model_box,
         reference_detail_box=ref_box,
+        reference_type=(
+            vlm_result.reference_type if vlm_result is not None else ReferenceType.GARMENT
+        ),
     )
 
     mask_strategy = MaskingStrategy.AUTO_VISION if auto_vlm else MaskingStrategy.MANIFEST_ROI

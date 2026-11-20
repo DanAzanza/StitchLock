@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -26,10 +27,17 @@ from src.models import (
     ComfyExecutionError,
     NormalizedBox,
     PipelineConfig,
+    ReferenceType,
     load_pipeline_config,
 )
 from src.pipeline import GarmentCorrectionPipeline
-from src.vlm_inspector import MAX_DEFECTS_PER_IMAGE, Qwen3VLInspector
+from src.vlm_heuristics import tighten_standalone_logo_box
+from src.vlm_inspector import (
+    MAX_DEFECTS_PER_IMAGE,
+    REFERENCE_CLASSIFICATION_PROMPT,
+    Qwen3VLInspector,
+    _resize_for_vlm,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -245,6 +253,9 @@ def test_vlm_misplaced_logo_erase_prompt_and_solo_lookup_order(
     inspector = Qwen3VLInspector(ComfyConfig(), inspector_wf)
     solo_calls: list[str] = []
     plain_ref = np.full((256, 256, 3), 100, dtype=np.uint8)
+    monkeypatch.setattr(
+        inspector, "_classify_reference_type", lambda *_a, **_kw: ReferenceType.GARMENT
+    )
     monkeypatch.setattr(inspector, "_run_comfy_vlm", lambda *args, **kwargs: raw_json)
     monkeypatch.setattr(
         inspector,
@@ -638,3 +649,163 @@ def test_comfy_server_manager_isolated_lifecycle(
     assert terminated_pids == [4242, 4243, 5002]
     assert mgr_b.process is None
     assert mgr_b.server_url is None
+
+
+def test_reference_type_classification_and_logo_inspection_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Qwen3VLInspector.parse_reference_type_json('{"reference_type": "logo"}') == (
+        ReferenceType.LOGO
+    )
+    assert Qwen3VLInspector.parse_reference_type_json('{"reference_type": "garment"}') == (
+        ReferenceType.GARMENT
+    )
+    # Malformed or unknown output falls back safely to garment
+    assert Qwen3VLInspector.parse_reference_type_json("not json") == ReferenceType.GARMENT
+    assert Qwen3VLInspector.parse_reference_type_json('{"reference_type": "unknown"}') == (
+        ReferenceType.GARMENT
+    )
+
+    # Standalone multicolor logo on pure black (e.g. PAC-MAN style) must keep full extent
+    logo_rgb = np.zeros((256, 256, 3), dtype=np.uint8)
+    logo_rgb[96:160, 24:110] = (245, 205, 65)
+    logo_rgb[96:160, 120:232] = (235, 80, 60)
+    tight = tighten_standalone_logo_box(logo_rgb)
+    assert tight.x_min <= 0.09
+    assert tight.x_max >= 0.91
+    assert tight.y_min <= 0.37
+    assert tight.y_max >= 0.63
+
+    # Uniform blank image falls back cleanly instead of collapsing
+    blank = np.full((128, 128, 3), 240, dtype=np.uint8)
+    fallback_box = NormalizedBox(0.10, 0.20, 0.90, 0.80)
+    assert tighten_standalone_logo_box(blank, fallback_box=fallback_box) == fallback_box
+
+    # Mock on-model hoodie with pink wordmark on lower-left back
+    model_rgb = np.full((256, 256, 3), 240, dtype=np.uint8)
+    model_rgb[40:240, 60:170] = (15, 15, 18)
+    model_rgb[105:130, 72:130] = (230, 40, 125)
+
+    logo_json = json.dumps(
+        {
+            "has_defect": True,
+            "defect_summary": "Replace FORTNITE back wordmark with PAC-MAN logo",
+            "defects": [
+                {
+                    "defect_summary": "Replace FORTNITE wordmark",
+                    "model_bbox_2d": [275, 410, 510, 505],
+                    "ref_bbox_2d": [45, 370, 955, 630],
+                    "edit_prompt": (
+                        "Edit <image1>: Replace ONLY the pink FORTNITE wordmark with "
+                        "the PAC-MAN logo from <image2>."
+                    ),
+                }
+            ],
+        }
+    )
+
+    # Shifted model vs logo coords must NOT trigger garment-anatomical erase+insert split
+    parsed_logo = Qwen3VLInspector.parse_vlm_json_response(
+        raw_text=logo_json,
+        model_rgb=model_rgb,
+        ref_rgb=logo_rgb,
+        reference_type=ReferenceType.LOGO,
+    )
+    assert parsed_logo.reference_type == ReferenceType.LOGO
+    assert parsed_logo.to_dict()["reference_type"] == "logo"
+    assert len(parsed_logo.resolved_defects) == 1
+    assert Qwen3VLInspector._is_erase_defect(parsed_logo.resolved_defects[0].edit_prompt) is False
+
+    # has_defect=False with LOGO reference must NOT run garment 3x3 micro-emblem scan
+    clean_logo_json = json.dumps(
+        {"has_defect": False, "defect_summary": "Already matching", "defects": []}
+    )
+    clean_logo = Qwen3VLInspector.parse_vlm_json_response(
+        raw_text=clean_logo_json,
+        model_rgb=model_rgb,
+        ref_rgb=logo_rgb,
+        reference_type=ReferenceType.LOGO,
+    )
+    assert clean_logo.has_defect is False
+    assert clean_logo.reference_type == ReferenceType.LOGO
+
+    # inspect_garment_pair routes LOGO reference to _run_logo_vlm and skips garment solo lookup
+    inspector_wf = ROOT_DIR / "workflows" / "qwen3_vl_inspector_api.json"
+    inspector = Qwen3VLInspector(ComfyConfig(), inspector_wf)
+    routed: list[str] = []
+    monkeypatch.setattr(
+        inspector, "_classify_reference_type", lambda *_a, **_kw: ReferenceType.LOGO
+    )
+    monkeypatch.setattr(
+        inspector,
+        "_run_logo_vlm",
+        lambda *_a, **_kw: routed.append("logo") or logo_json,
+    )
+    monkeypatch.setattr(
+        inspector,
+        "_run_comfy_vlm",
+        lambda *_a, **_kw: routed.append("garment") or logo_json,
+    )
+    monkeypatch.setattr(
+        inspector,
+        "_locate_ref_detail_single_image",
+        lambda **_kw: routed.append("solo") or None,
+    )
+    inspected = inspector.inspect_garment_pair(
+        model_rgb, logo_rgb, "hoodie_pacman", server_url="http://127.0.0.1:8000"
+    )
+    assert routed == ["logo"]
+    assert inspected.reference_type == ReferenceType.LOGO
+    assert inspected.reference_detail_box.x_min <= 0.09
+    assert inspected.reference_detail_box.x_max >= 0.91
+
+    # _resize_for_vlm preserves small inputs, downscales oversized images, and keeps min >= 32px
+    small = np.zeros((256, 128, 3), dtype=np.uint8)
+    assert _resize_for_vlm(small, max_side=512) is small
+    wide = np.zeros((1200, 2400, 3), dtype=np.uint8)
+    resized = _resize_for_vlm(wide, max_side=1024)
+    assert resized.shape == (512, 1024, 3)
+    thin = np.zeros((20, 2000, 3), dtype=np.uint8)
+    assert _resize_for_vlm(thin, max_side=512).shape == (32, 512, 3)
+
+    # _classify_reference_type strips node "2" / images.image2, downscales to <=512, sets max_len=48
+    captured_workflows: list[dict[str, object]] = []
+    uploaded_shapes: list[tuple[int, int]] = []
+
+    def _fake_upload(server_url: str, filename: str, png_bytes: bytes) -> str:
+        from io import BytesIO
+
+        from PIL import Image
+
+        _ = server_url
+        with Image.open(BytesIO(png_bytes)) as im:
+            uploaded_shapes.append(im.size)
+        return filename
+
+    def _fake_exec(server_url: str, workflow: dict[str, object], case_id: str) -> str:
+        _ = (server_url, case_id)
+        captured_workflows.append(workflow)
+        return '{"reference_type": "logo"}'
+
+    monkeypatch.setattr("src.vlm_inspector.upload_png_bytes", _fake_upload)
+    real_cls_inspector = Qwen3VLInspector(ComfyConfig(), inspector_wf)
+    monkeypatch.setattr(real_cls_inspector, "_execute_vlm_workflow", _fake_exec)
+
+    big_logo = np.zeros((2400, 2400, 3), dtype=np.uint8)
+    cls_res = real_cls_inspector._classify_reference_type("http://127.0.0.1:8000", big_logo, "pac")
+    assert cls_res == ReferenceType.LOGO
+    assert uploaded_shapes == [(512, 512)]
+    wf_sent: Any = captured_workflows[0]
+    assert "2" not in wf_sent
+    assert "images.image2" not in wf_sent["4"]["inputs"]
+    assert wf_sent["4"]["inputs"]["max_length"] == 48
+    assert wf_sent["4"]["inputs"]["prompt"] == REFERENCE_CLASSIFICATION_PROMPT
+
+    # Offline/error inside _execute_vlm_workflow must fail fast (not swallow ComfyExecutionError)
+    monkeypatch.setattr(
+        real_cls_inspector,
+        "_execute_vlm_workflow",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ComfyExecutionError("timeout")),
+    )
+    with pytest.raises(ComfyExecutionError, match="timeout"):
+        real_cls_inspector._classify_reference_type("http://127.0.0.1:8000", big_logo, "pac")

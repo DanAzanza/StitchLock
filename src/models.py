@@ -39,6 +39,13 @@ class MaskingStrategy(StrEnum):
     MANIFEST_ROI = "manifest_roi"
 
 
+class ReferenceType(StrEnum):
+    """Supported reference image types."""
+
+    GARMENT = "garment"
+    LOGO = "logo"
+
+
 @dataclass(frozen=True)
 class NormalizedBox:
     """Normalized bounding box [x_min, y_min, x_max, y_max] in [0.0, 1.0]."""
@@ -133,6 +140,7 @@ class CaseManifest:
     reference_image_filename: str
     model_target_box: NormalizedBox
     reference_detail_box: NormalizedBox
+    reference_type: ReferenceType = ReferenceType.GARMENT
 
 
 @dataclass(frozen=True)

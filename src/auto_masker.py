@@ -19,8 +19,10 @@ from src.models import (
     MaskingStrategy,
     NormalizedBox,
     PixelBBox,
+    ReferenceType,
     resolve_safe_path,
 )
+from src.vlm_heuristics import compute_foreground_mask, sample_four_corner_bg_rgb
 
 SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 REFERENCE_STEM_SUFFIX = "_reference"
@@ -292,14 +294,27 @@ class AutoMasker:
                     dilation_px=dilation_px,
                 )
             )
+            if manifest.reference_type == ReferenceType.LOGO:
+                cropped_product_ref = self._prepare_standalone_logo_reference(
+                    ref_rgb=ref_rgb,
+                    ref_detail_bbox=ref_detail_bbox,
+                    target_size=(context_bbox.width, context_bbox.height),
+                )
         else:
             context_bbox = PixelBBox(x1=0, y1=0, x2=width, y2=height)
             cropped_model_roi = model_rgb.copy()
-            cropped_product_ref = self._align_full_garment_reference(
-                ref_rgb=ref_rgb,
-                ref_detail_bbox=ref_detail_bbox,
-                target_bbox=target_bbox,
-                model_size=(width, height),
+            cropped_product_ref = (
+                self._prepare_standalone_logo_reference(
+                    ref_rgb=ref_rgb,
+                    ref_detail_bbox=ref_detail_bbox,
+                )
+                if manifest.reference_type == ReferenceType.LOGO
+                else self._align_full_garment_reference(
+                    ref_rgb=ref_rgb,
+                    ref_detail_bbox=ref_detail_bbox,
+                    target_bbox=target_bbox,
+                    model_size=(width, height),
+                )
             )
             cropped_mask_greyscale = full_mask_greyscale
 
@@ -415,6 +430,9 @@ class AutoMasker:
 
         binary_mask = np.zeros((image_height, image_width), dtype=np.uint8)
         binary_mask[y1:y2, x1:x2] = 1
+        clipped_fg = AutoMasker._clip_box_to_studio_foreground(model_rgb, x1, y1, x2, y2)
+        if clipped_fg is not None:
+            binary_mask[y1:y2, x1:x2] = clipped_fg
 
         # Compute Euclidean distance to the nearest zero pixel (strictly inside binary_mask == 1)
         dist = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
@@ -427,6 +445,57 @@ class AutoMasker:
         # Enforce hard zero outside binary_mask
         feathered = np.where(binary_mask > 0, feathered, np.float32(0.0))
         return binary_mask, feathered
+
+    @staticmethod
+    def _clip_box_to_studio_foreground(
+        model_rgb: NDArray[np.uint8],
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+    ) -> NDArray[np.uint8] | None:
+        """Clip only unmistakable exterior studio backdrop from a garment-edge mask box."""
+        image_height, image_width = model_rgb.shape[:2]
+        c_w = max(4, image_width // 20)
+        c_h = max(4, image_height // 20)
+        corners = np.concatenate(
+            [
+                model_rgb[0:c_h, 0:c_w, :].reshape(-1, 3),
+                model_rgb[0:c_h, image_width - c_w : image_width, :].reshape(-1, 3),
+            ],
+            axis=0,
+        ).astype(np.float32)
+        corner_std = float(np.max(np.std(corners, axis=0)))
+        if corner_std > 12.0:
+            return None
+
+        bg_med = np.asarray(np.median(corners, axis=0), dtype=np.float32)
+        bg_thr = min(14.0, max(6.0, corner_std * 2.0 + 3.0))
+        fg_full = compute_foreground_mask(model_rgb.astype(np.float32), bg_med, bg_thr)
+        fg_in_box = fg_full[y1:y2, x1:x2]
+        fg_frac = float(np.mean(fg_in_box))
+        if not (0.35 <= fg_frac < 1.0) or int(np.count_nonzero(fg_in_box)) < 64:
+            return None
+
+        # At least one full box side must lie solidly inside the garment, never all-around cloth
+        max_side_fg = max(
+            float(np.mean(fg_in_box[:, 0])),
+            float(np.mean(fg_in_box[:, -1])),
+            float(np.mean(fg_in_box[0, :])),
+            float(np.mean(fg_in_box[-1, :])),
+        )
+        if max_side_fg < 0.85:
+            return None
+
+        patch_f = model_rgb[y1:y2, x1:x2].astype(np.float32)
+        bg_diff_mean = float(np.mean(np.linalg.norm(patch_f[~fg_in_box] - bg_med, axis=1)))
+        if bg_diff_mean > min(8.0, bg_thr * 0.65):
+            return None
+
+        fg_med = np.median(patch_f[fg_in_box], axis=0)
+        if float(np.linalg.norm(fg_med - bg_med)) < 45.0:
+            return None
+        return fg_in_box.astype(np.uint8)
 
     @staticmethod
     def _align_full_garment_reference(
@@ -483,3 +552,34 @@ class AutoMasker:
             borderValue=border_rgb,
         )
         return np.asarray(aligned, dtype=np.uint8)
+
+    @staticmethod
+    def _prepare_standalone_logo_reference(
+        ref_rgb: NDArray[np.uint8],
+        ref_detail_bbox: PixelBBox,
+        target_size: tuple[int, int] | None = None,
+    ) -> NDArray[np.uint8]:
+        """Center a standalone logo crop on its uniform backdrop without clipping sides."""
+        logo_crop = ref_rgb[
+            ref_detail_bbox.y1 : ref_detail_bbox.y2,
+            ref_detail_bbox.x1 : ref_detail_bbox.x2,
+        ]
+        border_rgb = tuple(int(v) for v in sample_four_corner_bg_rgb(ref_rgb))
+        crop_h, crop_w = logo_crop.shape[:2]
+        side = max(64, int(round(max(crop_h, crop_w) * 1.28)))
+        canvas = np.full((side, side, 3), border_rgb, dtype=np.uint8)
+        y_off = (side - crop_h) // 2
+        x_off = (side - crop_w) // 2
+        canvas[y_off : y_off + crop_h, x_off : x_off + crop_w] = logo_crop
+
+        if target_size is not None:
+            dst_w, dst_h = target_size
+            interp = cv2.INTER_AREA if side > max(dst_w, dst_h) else cv2.INTER_LANCZOS4
+            return np.asarray(
+                cv2.resize(canvas, (dst_w, dst_h), interpolation=interp), dtype=np.uint8
+            )
+        if side > 1024:
+            return np.asarray(
+                cv2.resize(canvas, (1024, 1024), interpolation=cv2.INTER_AREA), dtype=np.uint8
+            )
+        return canvas
