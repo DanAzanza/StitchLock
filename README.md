@@ -198,7 +198,18 @@ We enforce unmasked preservation and masked-region quality through three complem
 
 ---
 
-## 4. Quickstart & Reproducible Verification
+## 4. What I Would Try Next in Production
+
+1. **Pose-Aware Garment & Logo Perspective Alignment**:
+   - Currently, `_align_full_garment_reference` aligns the reference garment frame to the On-Model frame via 2D translation when framing headroom differs. When a model turns sharply sideways or wears a garment at an extreme perspective angle, a rigid translation cannot match foreshortening.
+   - **Next Step**: Use lightweight pose/garment keypoint estimation (e.g. shoulder/chest/hem anchors or DensePose UV) to scale and gently perspective-align the full reference garment frame before passing `<image2>` into `Qwen-Image 2.1`, keeping 1:1 logo proportions across angled poses.
+2. **Parallelized Multi-GPU / Cloud Batch Inference**:
+   - Currently, sequential 20-step `Qwen3-VL-8B` + `Qwen-Image 2.1` inference runs one item at a time on a single local ComfyUI instance, scaling linearly with catalog batch size.
+   - **Next Step**: Add an async worker pool or cloud inference adapter in `src/comfy_client.py` to process catalog batches in parallel while keeping Stage 1 (Auto-Masker), Stage 3 (Strict Pixel-Lock Compositor), and Stage 4 (Automated Verification Gate) locally enforced as an immutable quality firewall.
+
+---
+
+## 5. Quickstart & Reproducible Verification
 
 ### Option A: 1-Click Artist Studio Launcher (Windows & Linux/macOS)
 - **Windows**: Double-click **`install.bat`** once to set up the environment, then launch **`run_pipeline.bat`** to start ComfyUI automatically, open the interactive Web UI (`http://127.0.0.1:7860`) in your browser, manage the `test_cases/` inbox (single-case processing or full batch), and cleanly shut down ComfyUI when the browser tab closes.
