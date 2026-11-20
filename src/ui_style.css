@@ -8,9 +8,9 @@ body {
 
 .gradio-container {
     max-width: 1560px !important;
-    min-height: 100vh !important;
+    min-height: 100dvh !important;
     margin: 0 auto !important;
-    padding: 12px 22px 14px 22px !important;
+    padding: 10px 20px !important;
     display: flex !important;
     flex-direction: column !important;
     box-sizing: border-box !important;
@@ -20,14 +20,14 @@ body {
     background: linear-gradient(135deg, rgba(16, 185, 129, 0.10), rgba(59, 130, 246, 0.06));
     border: 1px solid rgba(148, 163, 184, 0.20);
     border-radius: 14px;
-    padding: 10px 20px;
-    margin-bottom: 10px;
+    padding: 8px 18px;
+    margin-bottom: 6px;
     flex: 0 0 auto !important;
 }
 
 .stitch-header h1 {
     margin: 0 0 2px 0 !important;
-    font-size: 1.4rem !important;
+    font-size: 1.3rem !important;
     font-weight: 700 !important;
     letter-spacing: -0.02em !important;
 }
@@ -35,13 +35,13 @@ body {
 .stitch-header p {
     margin: 0 !important;
     opacity: 0.78;
-    font-size: 0.88rem !important;
+    font-size: 0.84rem !important;
 }
 
 .stitch-main-row {
     flex: 1 1 auto !important;
     align-items: stretch !important;
-    min-height: calc(100vh - 108px) !important;
+    min-height: 0 !important;
 }
 
 .stitch-sidebar {
@@ -100,8 +100,8 @@ body {
 }
 
 .stitch-sidebar .grid-wrap button.thumbnail-item {
-    height: clamp(115px, 14vh, 155px) !important;
-    min-height: 115px !important;
+    height: clamp(96px, 13dvh, 145px) !important;
+    min-height: 96px !important;
 }
 
 .stitch-workspace {
@@ -148,7 +148,7 @@ body {
 .stitch-triad .block:not(.fullscreen),
 .stitch-triad .block:not(.fullscreen) .image-container,
 .stitch-triad .block:not(.fullscreen) [data-testid="image"] {
-    height: clamp(140px, 19vh, 210px) !important;
+    height: clamp(125px, 18dvh, 195px) !important;
 }
 
 .stitch-triad .block:not(.fullscreen) label {
@@ -187,17 +187,45 @@ body {
 
 /* Centered, uncropped, pixel-aligned stage for Before/After Compare Slider & Heatmap */
 .stitch-compare-stage {
-    max-width: min(460px, 100%) !important;
+    max-width: min(440px, 100%) !important;
     width: 100% !important;
     margin: 4px auto 0 auto !important;
 }
 
 .stitch-compare-stage .block:not(.fullscreen) {
-    height: clamp(240px, 36vh, 420px) !important;
-    max-height: clamp(240px, 36vh, 420px) !important;
+    height: clamp(220px, 38dvh, 400px) !important;
+    max-height: clamp(220px, 38dvh, 400px) !important;
 }
 
-.stitch-compare-stage img {
+.stitch-compare-stage .block:not(.fullscreen) .image-container,
+.stitch-compare-stage .block:not(.fullscreen) .slider-wrap,
+.stitch-compare-stage .block:not(.fullscreen) .wrap,
+.stitch-compare-stage .block:not(.fullscreen) .content {
+    height: 100% !important;
+    max-height: 100% !important;
+}
+
+.stitch-compare-stage .block:not(.fullscreen) img {
+    width: 100% !important;
+    height: 100% !important;
+    max-width: 100% !important;
+    max-height: 100% !important;
+    object-fit: contain !important;
+}
+
+.stitch-compare-stage .block.fullscreen .image-container,
+.stitch-compare-stage .block.fullscreen .slider-wrap,
+.stitch-compare-stage .block.fullscreen .wrap,
+.stitch-compare-stage .block.fullscreen .content {
+    height: 100% !important;
+    width: 100% !important;
+}
+
+.stitch-compare-stage .block.fullscreen img {
+    max-width: 92vw !important;
+    max-height: 92dvh !important;
+    width: 100% !important;
+    height: 100% !important;
     object-fit: contain !important;
 }
 
