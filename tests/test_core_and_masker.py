@@ -328,8 +328,10 @@ def test_rgba_alpha_and_icc_profile_preservation_roundtrip(tmp_path: Path) -> No
             cropped_mask_greyscale: np.ndarray,
             prompt: str,
             case_id: str,
+            *,
+            denoise_override: float | None = None,
         ) -> tuple[np.ndarray, str]:
-            _ = (cropped_model_roi, cropped_mask_greyscale, prompt, case_id)
+            _ = (cropped_model_roi, cropped_mask_greyscale, prompt, case_id, denoise_override)
             return cropped_product_ref.copy(), "stub_bridge"
 
     pipeline = GarmentCorrectionPipeline(
@@ -462,25 +464,29 @@ def test_standalone_logo_masker_and_transparent_png_handling(tmp_path: Path) -> 
     opaque_out = convert_reference_image_to_rgb(Image.fromarray(opaque_rgb, mode="RGB"))
     assert np.array_equal(opaque_out, opaque_rgb)
 
-    # 3/4 pose perspective skew estimation & 2D homography warp direction
+    # 3/4 pose perspective skew estimation & 2.5D precomposite warp direction
     pose_model = np.full((400, 400, 3), 240, dtype=np.uint8)
     pose_model[80:360, 100:280] = (15, 16, 20)  # Garment silhouette spanning x=100..280
     left_back_skew = AutoMasker._estimate_garment_perspective_skew(
         pose_model, PixelBBox(110, 160, 180, 210)
     )
-    assert left_back_skew > 0.08
+    assert left_back_skew < -0.08
     center_skew = AutoMasker._estimate_garment_perspective_skew(
         pose_model, PixelBBox(155, 160, 225, 210)
     )
     assert center_skew == 0.0
 
-    warped_logo = AutoMasker._prepare_standalone_logo_reference(
+    precomp = AutoMasker.build_perspective_logo_precomposite(
+        clean_model_rgb=pose_model,
         ref_rgb=logo_ref,
+        target_bbox=PixelBBox(110, 150, 250, 220),
         ref_detail_bbox=PixelBBox(20, 150, 380, 250),
-        perspective_skew=0.18,
+        perspective_skew=-0.20,
     )
-    wy, wx = np.where(warped_logo[:, :, 0] > 180)
-    mid_x = warped_logo.shape[1] // 2
+    wy, wx = np.where((precomp[:, :, 0] > 180) & (precomp[:, :, 2] < 100))
+    mid_x = int(0.5 * (wx.min() + wx.max()))
     left_span = int(wy[wx < mid_x].max() - wy[wx < mid_x].min())
     right_span = int(wy[wx >= mid_x].max() - wy[wx >= mid_x].min())
-    assert left_span > right_span
+    assert right_span > left_span
+    # Outside target_bbox, precomposite preserves clean_model_rgb untouched
+    assert np.array_equal(precomp[:, :110], pose_model[:, :110])

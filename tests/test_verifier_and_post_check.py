@@ -208,8 +208,10 @@ class _StubPostCheckBridge(ComfyQwenBridge):
         cropped_mask_greyscale: NDArray[np.uint8],
         prompt: str,
         case_id: str,
+        *,
+        denoise_override: float | None = None,
     ) -> tuple[NDArray[np.uint8], str]:
-        _ = (prompt, case_id)
+        _ = (prompt, case_id, denoise_override)
         self._validate_inputs(cropped_model_roi, cropped_product_ref, cropped_mask_greyscale)
         return cropped_product_ref.copy(), "comfyui_qwen_2_1 (post_check_stub)"
 

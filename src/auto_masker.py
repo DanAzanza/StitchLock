@@ -589,7 +589,149 @@ class AutoMasker:
         rel_cx = (t_cx - gx1) / span
         if 0.42 <= rel_cx <= 0.58:
             return 0.0
-        return float(np.clip((0.5 - rel_cx) * 0.70, -0.22, 0.22))
+        # Outer silhouette side curves away from camera: left-shifted target -> left edge recedes
+        return float(np.clip((rel_cx - 0.5) * 0.85, -0.24, 0.24))
+
+    @staticmethod
+    def build_perspective_logo_precomposite(
+        clean_model_rgb: NDArray[np.uint8],
+        ref_rgb: NDArray[np.uint8],
+        target_bbox: PixelBBox,
+        ref_detail_bbox: PixelBBox,
+        perspective_skew: float = 0.0,
+    ) -> NDArray[np.uint8]:
+        """Project a standalone logo with 2.5D homography + cylindrical warp onto clean fabric."""
+        logo_crop = ref_rgb[
+            ref_detail_bbox.y1 : ref_detail_bbox.y2,
+            ref_detail_bbox.x1 : ref_detail_bbox.x2,
+        ]
+        if logo_crop.size == 0:
+            return clean_model_rgb.copy()
+
+        bg_med = sample_four_corner_bg_rgb(ref_rgb)
+        dist = np.linalg.norm(logo_crop.astype(np.float32) - bg_med.reshape(1, 1, 3), axis=2)
+        alpha = np.clip((dist - 18.0) / 26.0, 0.0, 1.0).astype(np.float32)
+        alpha = np.asarray(cv2.GaussianBlur(alpha, (3, 3), 0.6), dtype=np.float32)
+
+        crop_h, crop_w = logo_crop.shape[:2]
+        pad_x = max(4, int(round(target_bbox.width * 0.08)))
+        pad_y = max(4, int(round(target_bbox.height * 0.12)))
+        dst_x1 = target_bbox.x1 + pad_x
+        dst_x2 = max(dst_x1 + 8, target_bbox.x2 - pad_x)
+        dst_y1 = target_bbox.y1 + pad_y
+        dst_y2 = max(dst_y1 + 8, target_bbox.y2 - pad_y)
+        avail_w = float(dst_x2 - dst_x1)
+        avail_h = float(dst_y2 - dst_y1)
+        scale = min(avail_w / max(1.0, float(crop_w)), avail_h / max(1.0, float(crop_h)))
+        placed_w = max(8, int(round(crop_w * scale)))
+        placed_h = max(8, int(round(crop_h * scale)))
+        ox1 = int(round(0.5 * (dst_x1 + dst_x2) - 0.5 * placed_w))
+        oy1 = int(round(0.5 * (dst_y1 + dst_y2) - 0.5 * placed_h))
+        ox2 = ox1 + placed_w
+        oy2 = oy1 + placed_h
+
+        # Build inverse perspective + cylindrical map inside placed box -> logo_crop coords
+        s = abs(perspective_skew)
+        src_pts = np.array(
+            [
+                [0.0, 0.0],
+                [float(crop_w), 0.0],
+                [float(crop_w), float(crop_h)],
+                [0.0, float(crop_h)],
+            ],
+            dtype=np.float32,
+        )
+        dx = placed_w * 0.22 * s
+        dy_top = placed_h * 0.60 * s
+        dy_bot = placed_h * 0.45 * s
+        dy_near = placed_h * 0.12 * s
+        if perspective_skew < 0:
+            # Left edge recedes away from camera
+            dst_pts = np.array(
+                [
+                    [dx, dy_top],
+                    [float(placed_w), -dy_near],
+                    [float(placed_w), float(placed_h) + dy_near],
+                    [dx, float(placed_h) - dy_bot],
+                ],
+                dtype=np.float32,
+            )
+        elif perspective_skew > 0:
+            # Right edge recedes away from camera
+            dst_pts = np.array(
+                [
+                    [0.0, -dy_near],
+                    [float(placed_w) - dx, dy_top],
+                    [float(placed_w) - dx, float(placed_h) - dy_bot],
+                    [0.0, float(placed_h) + dy_near],
+                ],
+                dtype=np.float32,
+            )
+        else:
+            dst_pts = np.array(
+                [
+                    [0.0, 0.0],
+                    [float(placed_w), 0.0],
+                    [float(placed_w), float(placed_h)],
+                    [0.0, float(placed_h)],
+                ],
+                dtype=np.float32,
+            )
+
+        inv_h = cv2.getPerspectiveTransform(dst_pts, src_pts)
+        gx, gy = np.meshgrid(
+            np.arange(placed_w, dtype=np.float32), np.arange(placed_h, dtype=np.float32)
+        )
+        # Subtle cylindrical foreshortening toward the receding edge
+        if abs(perspective_skew) >= 0.04:
+            u = gx / max(1.0, float(placed_w - 1))
+            curve = 0.35 * s
+            u_curved = (
+                1.0 - np.power(np.clip(1.0 - u, 0.0, 1.0), 1.0 + curve)
+                if perspective_skew < 0
+                else np.power(np.clip(u, 0.0, 1.0), 1.0 + curve)
+            )
+            gx = u_curved * float(placed_w - 1)
+
+        ones = np.ones_like(gx)
+        pts = np.stack([gx, gy, ones], axis=-1)
+        mapped = pts @ inv_h.T
+        denom = np.where(np.abs(mapped[..., 2]) > 1e-6, mapped[..., 2], 1.0)
+        map_x = (mapped[..., 0] / denom).astype(np.float32)
+        map_y = (mapped[..., 1] / denom).astype(np.float32)
+
+        warped_rgb = cv2.remap(
+            logo_crop,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        warped_alpha = cv2.remap(
+            alpha,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+
+        out = clean_model_rgb.copy()
+        img_h, img_w = out.shape[:2]
+        cx1, cy1 = max(0, ox1), max(0, oy1)
+        cx2, cy2 = min(img_w, ox2), min(img_h, oy2)
+        if cx2 <= cx1 or cy2 <= cy1:
+            return out
+
+        sx1, sy1 = cx1 - ox1, cy1 - oy1
+        sx2, sy2 = sx1 + (cx2 - cx1), sy1 + (cy2 - cy1)
+        a_patch = warped_alpha[sy1:sy2, sx1:sx2, None]
+        rgb_patch = warped_rgb[sy1:sy2, sx1:sx2].astype(np.float32)
+        cloth_patch = out[cy1:cy2, cx1:cx2].astype(np.float32)
+        blended = rgb_patch * a_patch + cloth_patch * (1.0 - a_patch)
+        out[cy1:cy2, cx1:cx2] = np.clip(np.round(blended), 0, 255).astype(np.uint8)
+        return out
 
     @staticmethod
     def _prepare_standalone_logo_reference(

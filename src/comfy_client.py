@@ -202,6 +202,8 @@ class ComfyQwenBridge:
         cropped_mask_greyscale: NDArray[np.uint8],
         prompt: str,
         case_id: str,
+        *,
+        denoise_override: float | None = None,
     ) -> tuple[NDArray[np.uint8], str]:
         """Restore the garment detail ROI via live ComfyUI Qwen-Image 2.1 Edit.
 
@@ -226,6 +228,7 @@ class ComfyQwenBridge:
             cropped_mask_greyscale=cropped_mask_greyscale,
             prompt=prompt,
             case_id=case_id,
+            denoise_override=denoise_override,
         )
         return restored, f"comfyui_qwen_2_1 ({active_server})"
 
@@ -257,6 +260,8 @@ class ComfyQwenBridge:
         uploaded_mask_name: str,
         prompt: str,
         output_prefix: str,
+        *,
+        denoise_override: float | None = None,
     ) -> dict[str, Any]:
         """Inject uploaded asset filenames, prompt, and sampler parameters into workflow JSON."""
         workflow = copy.deepcopy(self._workflow_template)
@@ -282,7 +287,9 @@ class ComfyQwenBridge:
                 inputs["seed"] = self._config.seed
                 inputs["steps"] = self._config.steps
                 inputs["cfg"] = self._config.cfg
-                inputs["denoise"] = self._config.denoise
+                inputs["denoise"] = (
+                    self._config.denoise if denoise_override is None else float(denoise_override)
+                )
 
         return workflow
 
@@ -294,6 +301,8 @@ class ComfyQwenBridge:
         cropped_mask_greyscale: NDArray[np.uint8],
         prompt: str,
         case_id: str,
+        *,
+        denoise_override: float | None = None,
     ) -> NDArray[np.uint8]:
         """Execute pure Qwen-Image 2.1 Edit on full On-Model, full Product Ref, and mask."""
         run_token = uuid.uuid4().hex[:8]
@@ -315,6 +324,7 @@ class ComfyQwenBridge:
             uploaded_mask_name=mask_server_name,
             prompt=prompt,
             output_prefix=f"garment_fix_{case_id}",
+            denoise_override=denoise_override,
         )
         outputs = execute_comfy_prompt(
             server_url=server_url,

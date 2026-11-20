@@ -83,8 +83,10 @@ class _StubComfyBridge(ComfyQwenBridge):
         cropped_mask_greyscale: NDArray[np.uint8],
         prompt: str,
         case_id: str,
+        *,
+        denoise_override: float | None = None,
     ) -> tuple[NDArray[np.uint8], str]:
-        _ = (prompt, case_id)
+        _ = (prompt, case_id, denoise_override)
         self._validate_inputs(cropped_model_roi, cropped_product_ref, cropped_mask_greyscale)
         self.restore_calls += 1
         return cropped_product_ref.copy(), "comfyui_qwen_2_1 (stub)"
@@ -347,8 +349,10 @@ def test_multi_defect_sequential_loop_pipeline_and_ui(
             cropped_mask_greyscale: NDArray[np.uint8],
             prompt: str,
             case_id: str,
+            *,
+            denoise_override: float | None = None,
         ) -> tuple[NDArray[np.uint8], str]:
-            _ = (cropped_product_ref, cropped_mask_greyscale)
+            _ = (cropped_product_ref, cropped_mask_greyscale, denoise_override)
             recorded_calls.append((case_id, prompt))
             edited = cropped_model_roi.copy()
             color = (

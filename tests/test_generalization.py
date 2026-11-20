@@ -107,7 +107,10 @@ class _HoldoutBridge(ComfyQwenBridge):
         cropped_mask_greyscale: NDArray[np.uint8],
         prompt: str,
         case_id: str,
+        *,
+        denoise_override: float | None = None,
     ) -> tuple[NDArray[np.uint8], str]:
+        _ = denoise_override
         self._validate_inputs(cropped_model_roi, cropped_product_ref, cropped_mask_greyscale)
         self.calls.append(
             (case_id, (cropped_model_roi.shape[0], cropped_model_roi.shape[1]), prompt)

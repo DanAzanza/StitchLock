@@ -32,6 +32,7 @@ from src.models import (
     MaskingStrategy,
     PipelineConfig,
     PixelBBox,
+    ReferenceType,
     VerificationMetrics,
     resolve_safe_path,
 )
@@ -280,13 +281,57 @@ def execute_multi_defect_restoration(
             manifest=step_manifest,
         )
         step_case_id = f"{base_manifest.case_id}_d{idx}" if total > 1 else base_manifest.case_id
-        restored_roi_rgb, backend_used = bridge.restore_detail_roi(
-            cropped_model_roi=loc.cropped_model_roi,
-            cropped_product_ref=loc.cropped_product_ref,
-            cropped_mask_greyscale=loc.cropped_mask_greyscale,
-            prompt=defect.edit_prompt,
-            case_id=step_case_id,
+        is_erase = "remove" in defect.edit_prompt.lower() or "erase" in defect.edit_prompt.lower()
+        use_logo_two_pass = (
+            base_manifest.reference_type == ReferenceType.LOGO and total == 1 and not is_erase
         )
+        if use_logo_two_pass:
+            erase_prompt = (
+                "Edit <image1>: Remove and erase the printed graphic/wordmark inside the "
+                "masked region completely, leaving clean seamless plain garment fabric matching "
+                "the surrounding cloth color, texture, folds, hood, and lighting."
+            )
+            erased_roi, _ = bridge.restore_detail_roi(
+                cropped_model_roi=loc.cropped_model_roi,
+                cropped_product_ref=loc.cropped_model_roi,
+                cropped_mask_greyscale=loc.cropped_mask_greyscale,
+                prompt=erase_prompt,
+                case_id=f"{step_case_id}_erase",
+                denoise_override=1.0,
+            )
+            clean_rgb = compositor.composite(
+                original_image=current_rgb,
+                restored_roi=erased_roi,
+                binary_mask=loc.binary_mask,
+                feathered_mask=loc.feathered_mask,
+                context_bbox=loc.context_bbox,
+            )
+            skew = AutoMasker._estimate_garment_perspective_skew(clean_rgb, loc.target_bbox)
+            precomp_rgb = AutoMasker.build_perspective_logo_precomposite(
+                clean_model_rgb=clean_rgb,
+                ref_rgb=ref_rgb,
+                target_bbox=loc.target_bbox,
+                ref_detail_bbox=loc.ref_detail_bbox,
+                perspective_skew=skew,
+            )
+            cb = loc.context_bbox
+            harmonize_roi = precomp_rgb[cb.y1 : cb.y2, cb.x1 : cb.x2].copy()
+            restored_roi_rgb, backend_used = bridge.restore_detail_roi(
+                cropped_model_roi=harmonize_roi,
+                cropped_product_ref=loc.cropped_product_ref,
+                cropped_mask_greyscale=loc.cropped_mask_greyscale,
+                prompt=defect.edit_prompt,
+                case_id=f"{step_case_id}_harmonize",
+                denoise_override=0.58,
+            )
+        else:
+            restored_roi_rgb, backend_used = bridge.restore_detail_roi(
+                cropped_model_roi=loc.cropped_model_roi,
+                cropped_product_ref=loc.cropped_product_ref,
+                cropped_mask_greyscale=loc.cropped_mask_greyscale,
+                prompt=defect.edit_prompt,
+                case_id=step_case_id,
+            )
         current_rgb = compositor.composite(
             original_image=current_rgb,
             restored_roi=restored_roi_rgb,
