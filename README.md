@@ -3,7 +3,7 @@
 **Automated E-Commerce Garment Detail Correction Pipeline with Strict Unmasked RGB Pixel-Lock Verification**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![Release v1.0.1](https://img.shields.io/badge/release-v1.0.1-emerald.svg)](https://github.com/DanAzanza/StitchLock/releases)
+[![Release v1.1.0](https://img.shields.io/badge/release-v1.1.0-emerald.svg)](https://github.com/DanAzanza/StitchLock/releases)
 [![CI Quality Gate](https://github.com/DanAzanza/StitchLock/actions/workflows/ci.yml/badge.svg)](https://github.com/DanAzanza/StitchLock/actions/workflows/ci.yml)
 [![ComfyUI API](https://img.shields.io/badge/ComfyUI-REST%20%2F%20WebSocket-orange.svg)](workflows/qwen_2_1_edit_api.json)
 [![Architecture: DiT](https://img.shields.io/badge/Model-Qwen--Image%202.1%20Edit-purple.svg)](.agents/PROJECT.md)
